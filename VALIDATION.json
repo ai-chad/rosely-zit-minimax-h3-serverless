@@ -1,0 +1,15 @@
+{
+  "provision.sh": {
+    "bash_n_ok": true,
+    "stderr": ""
+  },
+  "scripts/start_model_server.sh": {
+    "bash_n_ok": true,
+    "stderr": ""
+  },
+  "unified_credentials_override_standard_aws_env": true,
+  "legacy_zit_credential_aliases_unset": true,
+  "unified_bucket_overrides_family_buckets": true,
+  "base_image": "vastai/pytorch:cuda-13.0.3-auto",
+  "disk_gb": 200
+}

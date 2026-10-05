@@ -175,4 +175,3 @@ After a live Vast deployment, run at minimum:
 6. Check `nvidia-smi`, `/health`, output S3 objects, and logs after every transition.
 
 See `DEPLOYMENT.md` and `MODEL_BUNDLE.md` for exact rollout steps.
-# rosely-zit-minimax-h3-serverless
