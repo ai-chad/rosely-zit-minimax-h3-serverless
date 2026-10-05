@@ -1,0 +1,30 @@
+Rosely H3 + ZiT RTX 5090 Vast Serverless - Release Validation
+Generated: 2026-10-04
+
+Source baselines inspected through connected GitHub:
+- robert2398/rosely-minimax-h3-ref2va-serverless main tree: 6f6056935dfc7a7b024f3186bceab56071a52c2b
+- robert2398/rosely-zit-v13-vast-serverless-upscaler-detailer main tree: 2cbfc062f9917e32ce8d8665a2e0e95892a367f6
+
+Validation performed on this package:
+- Python AST/compile validation: PASS
+- H3 workflow structure validation: PASS
+- All 8 ZiT workflow mode builders: PASS
+- ZiT alias/override/invalid-dimension unit tests: PASS (4 tests)
+- All 9 workflow JSON files parse: PASS
+- FastAPI model_server import: PASS
+- Required routes present: /generate/sync, /generate/video, /generate/image, /health, /ready, /status
+- Compatibility dispatch checks: PASS
+- One global asyncio GPU generation lock invariant: PASS
+- ComfyUI family-switch /free path present: PASS
+- Bash syntax for provision/start/status/bundle scripts: PASS
+- Secret-like static scan: no embedded AWS/private-key/API-key material detected
+- Combined mode requires an exact SHA-256: PASS
+- Readiness requires H3 core + ZiT core + production ZiT mode LoRAs: PASS
+
+Not executable in this build environment:
+- Live RTX 5090 CUDA inference
+- Actual Vast Serverless worker handshake
+- Live S3 model download using your credentials
+- H3 -> ZiT -> H3 VRAM switching with the real ~50 GB model set
+
+Therefore deploy this as a NEW endpoint first and run the smoke sequence in DEPLOYMENT.md before routing production traffic.
