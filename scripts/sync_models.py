@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -250,6 +252,65 @@ def _write_ready_marker(ready_marker: Path, *, family: str, mode: str, fingerpri
     )
 
 
+@contextmanager
+def _family_lock(state_dir: Path, family: str):
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / f"{family}.lock"
+    with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _finalize_seedvr2_layout(models_root: Path, entries: list[dict[str, Any]] | None = None) -> None:
+    """Ensure uppercase SEEDVR2/ exists (with lowercase alias) and pre-populate
+    ComfyUI-SeedVR2_VideoUpscaler's .validation_cache.json so the first upscaler
+    request never re-hashes or redownloads verified weights."""
+    upper = models_root / "SEEDVR2"
+    lower = models_root / "seedvr2"
+
+    if upper.is_dir() and not upper.is_symlink():
+        if lower.is_symlink() or not lower.exists():
+            lower.unlink(missing_ok=True)
+            os.symlink(upper, lower)
+        cache_dir = upper
+    elif lower.is_dir() and not lower.is_symlink():
+        if upper.is_symlink() or not upper.exists():
+            upper.unlink(missing_ok=True)
+            os.symlink(lower, upper)
+        cache_dir = upper
+    else:
+        return
+
+    cache_path = cache_dir / ".validation_cache.json"
+    cache: dict[str, Any] = {}
+    if cache_path.is_file():
+        try:
+            loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                cache = loaded
+        except Exception:
+            cache = {}
+
+    if entries:
+        for entry in entries:
+            rel_str = str(entry["rel_str"])
+            if not rel_str.lower().startswith("seedvr2/"):
+                continue
+            target = cache_dir / Path(rel_str).name
+            if target.is_file():
+                st = target.stat()
+                cache[target.name] = {
+                    "size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "hash": str(entry["sha256"]),
+                }
+        if cache:
+            _atomic_write_json(cache_path, cache)
+
+
 def _sync_direct_manifest(args: argparse.Namespace) -> None:
     family = args.family
     models_root = Path(args.comfy_dir) / "models"
@@ -324,6 +385,8 @@ def _sync_direct_manifest(args: argparse.Namespace) -> None:
     if _read_ready_fingerprint(ready_marker) == fingerprint and all(
         e["dest"].is_file() and e["dest"].stat().st_size == e["size"] for e in entries
     ):
+        if family == "zit":
+            _finalize_seedvr2_layout(models_root, entries)
         print(
             f"[{family}] verified direct manifest already ready ({len(entries)} files, {total_bytes / GIB:.2f} GiB)",
             flush=True,
@@ -432,6 +495,8 @@ def _sync_direct_manifest(args: argparse.Namespace) -> None:
         raise
 
     shutil.rmtree(staging_root, ignore_errors=True)
+    if family == "zit":
+        _finalize_seedvr2_layout(models_root, entries)
     _write_ready_marker(
         ready_marker,
         family=family,
@@ -610,24 +675,25 @@ def main() -> int:
     attempts = max(1, int(args.retries))
     is_manifest = args.model_key.strip().lower().endswith(".json")
 
-    for attempt in range(1, attempts + 1):
-        try:
-            if is_manifest:
-                _sync_direct_manifest(args)
-            else:
-                _sync_legacy_archive(args)
-            return 0
-        except Exception as exc:
-            print(
-                f"[{args.family}] sync attempt {attempt}/{attempts} failed: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            if attempt >= attempts:
-                return 1
-            backoff = min(30, 3 * attempt)
-            print(f"[{args.family}] retrying in {backoff}s...", file=sys.stderr, flush=True)
-            time.sleep(backoff)
+    with _family_lock(Path(args.state_dir), args.family):
+        for attempt in range(1, attempts + 1):
+            try:
+                if is_manifest:
+                    _sync_direct_manifest(args)
+                else:
+                    _sync_legacy_archive(args)
+                return 0
+            except Exception as exc:
+                print(
+                    f"[{args.family}] sync attempt {attempt}/{attempts} failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if attempt >= attempts:
+                    return 1
+                backoff = min(30, 3 * attempt)
+                print(f"[{args.family}] retrying in {backoff}s...", file=sys.stderr, flush=True)
+                time.sleep(backoff)
     return 1
 
 

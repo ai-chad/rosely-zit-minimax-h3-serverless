@@ -236,6 +236,29 @@ class StagedReadinessTests(unittest.TestCase):
             sync_models._sync_direct_manifest(args)
             self.assertEqual(len(download_calls), 2)
 
+    def test_seedvr2_layout_and_validation_cache_populated(self) -> None:
+        models_root = self.root / "seedvr2_models"
+        seedvr2_dir = models_root / "SEEDVR2"
+        seedvr2_dir.mkdir(parents=True, exist_ok=True)
+        gguf = seedvr2_dir / "seedvr2_ema_7b-Q4_K_M.gguf"
+        gguf.write_bytes(b"gguf-bytes")
+        entries = [
+            {
+                "rel_str": "SEEDVR2/seedvr2_ema_7b-Q4_K_M.gguf",
+                "sha256": "db9cb2ad90ebd40d2e8c29da2b3fc6fd03ba87cd58cbadceccca13ad27162789",
+            }
+        ]
+        sync_models._finalize_seedvr2_layout(models_root, entries)
+        self.assertTrue((models_root / "seedvr2").is_symlink())
+        cache_path = seedvr2_dir / ".validation_cache.json"
+        self.assertTrue(cache_path.is_file())
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        self.assertEqual(cache["seedvr2_ema_7b-Q4_K_M.gguf"]["size"], len(b"gguf-bytes"))
+        self.assertEqual(
+            cache["seedvr2_ema_7b-Q4_K_M.gguf"]["hash"],
+            "db9cb2ad90ebd40d2e8c29da2b3fc6fd03ba87cd58cbadceccca13ad27162789",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

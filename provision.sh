@@ -64,6 +64,7 @@ PYWORKER_REF="${PYWORKER_REF:-main}"
 MODEL_BUNDLE_MODE="${MODEL_BUNDLE_MODE:-direct}"
 MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-85}"
 INSTALL_ZIT_OPTIONAL_NODES="${ROSELY_INSTALL_ZIT_OPTIONAL_NODES:-true}"
+INSTALL_SAM2="${ROSELY_INSTALL_SAM2:-false}"
 WAIT_FOR_H3_DURING_PROVISION="${ROSELY_WAIT_FOR_H3_DURING_PROVISION:-false}"
 
 DEFAULT_H3_MODEL_NAME="10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors"
@@ -73,7 +74,7 @@ DEFAULT_H3_MANIFEST_KEY="models/minimax-h3/beta7_sulpher3/manifest.json"
 DEFAULT_H3_MANIFEST_SHA="45ad09171573a127d7388e6ab22ed0852069bc1046d5931bb821579175b7d529"
 
 DEFAULT_ZIT_MANIFEST_KEY="serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3-direct/manifest.json"
-DEFAULT_ZIT_MANIFEST_SHA="5cf16bd13b25e8e4197d1f0a2925fa5dd59a517247f07c478d0067292323c40c"
+DEFAULT_ZIT_MANIFEST_SHA="14b308d29489719b09beeff9708e6961537319eadc02cdac4f94b68da47fd6d4"
 LEGACY_ZIT_ARCHIVE_KEY="serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3.tar.zst"
 LEGACY_ZIT_ARCHIVE_SHA="cfbd87e06b3b570c40c1436bea5cb31c0b1c70b772254d13791162f41df64fb7"
 LEGACY_ZIT_ARCHIVE_SIZE="16309405103"
@@ -192,46 +193,89 @@ install_comfyui_preserving_models() {
   fi
 }
 
-install_optional_zit_nodes() {
-  [[ "$INSTALL_ZIT_OPTIONAL_NODES" == "true" ]] || {
+ensure_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Installing uv for fast parallel Python wheel installation"
+  python -m pip install --prefer-binary -q uv || true
+}
+
+fast_pip_install() {
+  if command -v uv >/dev/null 2>&1; then
+    if uv pip install --python /venv/main/bin/python --no-progress "$@"; then
+      return 0
+    fi
+    log "uv pip install failed; falling back to pip"
+  fi
+  python -m pip install --prefer-binary "$@"
+}
+
+filter_req_file() {
+  local src=$1 dst=$2 drop_sam2=${3:-false}
+  if [[ "$drop_sam2" == "true" ]]; then
+    awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/ && !/^(torch|torchvision|torchaudio|opencv-python)([<>=~! ].*)?$/ && !/facebookresearch\/sam2/' "$src" > "$dst"
+  else
+    awk '!/^[[:space:]]*#/ && !/^[[:space:]]*$/ && !/^(torch|torchvision|torchaudio|opencv-python)([<>=~! ].*)?$/' "$src" > "$dst"
+  fi
+}
+
+install_comfy_and_optional_zit_nodes() {
+  local req_args=()
+  filter_req_file "$COMFY_DIR/requirements.txt" "$STATE_DIR/comfy-requirements.filtered.txt" false
+  req_args+=(-r "$STATE_DIR/comfy-requirements.filtered.txt")
+
+  if [[ "$INSTALL_ZIT_OPTIONAL_NODES" == "true" ]]; then
+    log "Cloning pinned optional ZiT detailer/upscaler nodes in parallel"
+    local impact_ref=429d0159ad429e64d2b3916e6e7be9c22d025c3c
+    local sub_ref=50c7b71a6a224734cc9b21963c6d1926816a97f1
+    local seed_ref=4490bd1f482e026674543386bb2a4d176da245b9
+    local vr_ref=f633a8b0824e81cd9e3ad2f9f0f51f1f9680353b
+    mkdir -p "$COMFY_DIR/custom_nodes"
+
+    clone_exact_commit https://github.com/ltdrdata/ComfyUI-Impact-Pack.git "$impact_ref" "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack" &
+    local p1=$!
+    clone_exact_commit https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git "$sub_ref" "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Subpack" &
+    local p2=$!
+    clone_exact_commit https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git "$seed_ref" "$COMFY_DIR/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler" &
+    local p3=$!
+    clone_exact_commit https://github.com/vrgamegirl19/comfyui-vrgamedevgirl.git "$vr_ref" "$COMFY_DIR/custom_nodes/comfyui-vrgamedevgirl" &
+    local p4=$!
+    wait "$p1" "$p2" "$p3" "$p4"
+
+    local drop_sam2=true
+    [[ "$INSTALL_SAM2" == "true" ]] && drop_sam2=false
+    filter_req_file "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack/requirements.txt" "$STATE_DIR/impact-requirements.filtered.txt" "$drop_sam2"
+    filter_req_file "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Subpack/requirements.txt" "$STATE_DIR/subpack-requirements.filtered.txt" false
+    filter_req_file "$COMFY_DIR/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/requirements.txt" "$STATE_DIR/seedvr2-requirements.filtered.txt" false
+    filter_req_file "$COMFY_DIR/custom_nodes/comfyui-vrgamedevgirl/requirements.txt" "$STATE_DIR/vrgd-requirements.filtered.txt" false
+
+    req_args+=(
+      -r "$STATE_DIR/impact-requirements.filtered.txt"
+      -r "$STATE_DIR/subpack-requirements.filtered.txt"
+      -r "$STATE_DIR/seedvr2-requirements.filtered.txt"
+      -r "$STATE_DIR/vrgd-requirements.filtered.txt"
+      av imageio-ffmpeg transformers requests
+    )
+  else
     log "Optional ZiT detailer/upscaler nodes disabled"
-    return
-  }
-  log "Installing pinned optional ZiT detailer/upscaler nodes (parallel git clones)"
-  local impact_ref=429d0159ad429e64d2b3916e6e7be9c22d025c3c
-  local sub_ref=50c7b71a6a224734cc9b21963c6d1926816a97f1
-  local seed_ref=4490bd1f482e026674543386bb2a4d176da245b9
-  local vr_ref=f633a8b0824e81cd9e3ad2f9f0f51f1f9680353b
-  mkdir -p "$COMFY_DIR/custom_nodes"
+  fi
 
-  clone_exact_commit https://github.com/ltdrdata/ComfyUI-Impact-Pack.git "$impact_ref" "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack" &
-  local p1=$!
-  clone_exact_commit https://github.com/ltdrdata/ComfyUI-Impact-Subpack.git "$sub_ref" "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Subpack" &
-  local p2=$!
-  clone_exact_commit https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler.git "$seed_ref" "$COMFY_DIR/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler" &
-  local p3=$!
-  clone_exact_commit https://github.com/vrgamegirl19/comfyui-vrgamedevgirl.git "$vr_ref" "$COMFY_DIR/custom_nodes/comfyui-vrgamedevgirl" &
-  local p4=$!
-  wait "$p1" "$p2" "$p3" "$p4"
+  log "Installing ComfyUI + node Python dependencies in one fast pass (while ZiT downloads)"
+  fast_pip_install "${req_args[@]}"
 
-  awk '!/^(torch|torchvision|torchaudio|opencv-python)([<>= ].*)?$/' \
-    "$COMFY_DIR/custom_nodes/ComfyUI-SeedVR2_VideoUpscaler/requirements.txt" \
-    > "$STATE_DIR/seedvr2-requirements.filtered.txt"
+  if [[ "$INSTALL_ZIT_OPTIONAL_NODES" == "true" ]]; then
+    # Prevent Impact-Pack install.py from downloading sam_vit_b_01ec64.pth from
+    # external mirrors while our verified S3 ZiT sync provides it.
+    touch "$COMFY_DIR/custom_nodes/skip_download_model"
+    COMFYUI_PATH="$COMFY_DIR" COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
+      python "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack/install.py"
 
-  python -m pip install --prefer-binary \
-    -r "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack/requirements.txt" \
-    -r "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Subpack/requirements.txt" \
-    -r "$STATE_DIR/seedvr2-requirements.filtered.txt" \
-    -r "$COMFY_DIR/custom_nodes/comfyui-vrgamedevgirl/requirements.txt" \
-    av imageio-ffmpeg transformers requests
-
-  COMFYUI_PATH="$COMFY_DIR" COMFYUI_MODEL_PATH="$COMFY_DIR/models" \
-    python "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack/install.py"
-
-  if ! python -c 'import torchaudio' >/dev/null 2>&1; then
-    local torch_ver
-    torch_ver=$(python -c 'import torch; print(torch.__version__.split("+")[0])')
-    python -m pip install --no-deps "torchaudio==${torch_ver}"
+    if ! python -c 'import torchaudio' >/dev/null 2>&1; then
+      local torch_ver
+      torch_ver=$(python -c 'import torch; print(torch.__version__.split("+")[0])')
+      python -m pip install --no-deps "torchaudio==${torch_ver}"
+    fi
   fi
 }
 
@@ -324,7 +368,8 @@ git clone --progress --depth 1 --single-branch --branch "$PYWORKER_REF" "$PYWORK
 [[ -f "$APP_DIR/worker.py" && -f "$APP_DIR/model_server.py" && -f "$APP_DIR/scripts/sync_models.py" ]] || fail "Combined repository is incomplete"
 
 log "Installing application dependencies"
-python -m pip install --prefer-binary -r "$APP_DIR/requirements.txt"
+ensure_uv
+fast_pip_install -r "$APP_DIR/requirements.txt"
 
 install_comfyui_preserving_models
 mkdir -p "$COMFY_DIR/models"/{diffusion_models,text_encoders,vae,loras} "$COMFY_DIR"/{input,output,temp}
@@ -354,9 +399,7 @@ python -u "$APP_DIR/scripts/sync_models.py" \
   > /var/log/portal/zit-model-sync.log 2>&1 &
 ZIT_SYNC_PID=$!
 
-log "Installing pinned ComfyUI dependencies (while ZiT downloads)"
-python -m pip install --prefer-binary -r "$COMFY_DIR/requirements.txt"
-install_optional_zit_nodes
+install_comfy_and_optional_zit_nodes
 
 log "Waiting for ZiT model sync (pid=${ZIT_SYNC_PID}) to finish"
 if ! wait "$ZIT_SYNC_PID"; then
@@ -366,7 +409,13 @@ if ! wait "$ZIT_SYNC_PID"; then
 fi
 tail -25 /var/log/portal/zit-model-sync.log || true
 
-if [[ -d "$COMFY_DIR/models/seedvr2" ]]; then
+# Ensure SeedVR2 uppercase directory + lowercase compatibility alias both exist.
+if [[ -d "$COMFY_DIR/models/SEEDVR2" && ! -L "$COMFY_DIR/models/SEEDVR2" ]]; then
+  if [[ ! -e "$COMFY_DIR/models/seedvr2" || -L "$COMFY_DIR/models/seedvr2" ]]; then
+    rm -f "$COMFY_DIR/models/seedvr2"
+    ln -s "$COMFY_DIR/models/SEEDVR2" "$COMFY_DIR/models/seedvr2"
+  fi
+elif [[ -d "$COMFY_DIR/models/seedvr2" && ! -L "$COMFY_DIR/models/seedvr2" ]]; then
   rm -rf "$COMFY_DIR/models/SEEDVR2"
   ln -s "$COMFY_DIR/models/seedvr2" "$COMFY_DIR/models/SEEDVR2"
 fi
