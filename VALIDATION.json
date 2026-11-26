@@ -3,6 +3,10 @@
     "bash_n_ok": true,
     "stderr": ""
   },
+  "scripts/start_h3_sync.sh": {
+    "bash_n_ok": true,
+    "stderr": ""
+  },
   "scripts/start_model_server.sh": {
     "bash_n_ok": true,
     "stderr": ""
@@ -10,6 +14,12 @@
   "unified_credentials_override_standard_aws_env": true,
   "legacy_zit_credential_aliases_unset": true,
   "unified_bucket_overrides_family_buckets": true,
+  "model_bundle_mode": "direct",
+  "h3_model": "10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors",
+  "h3_manifest_key": "models/minimax-h3/beta7_sulpher3/manifest.json",
+  "h3_manifest_sha256": "45ad09171573a127d7388e6ab22ed0852069bc1046d5931bb821579175b7d529",
+  "zit_manifest_key": "serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3-direct/manifest.json",
+  "zit_manifest_sha256": "5cf16bd13b25e8e4197d1f0a2925fa5dd59a517247f07c478d0067292323c40c",
   "base_image": "vastai/pytorch:cuda-13.0.3-auto",
-  "disk_gb": 200
+  "disk_gb": 150
 }

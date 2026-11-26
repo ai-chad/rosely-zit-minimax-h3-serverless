@@ -4,6 +4,11 @@ set -Eeuo pipefail
 mkdir -p /var/log/portal
 : > /var/log/portal/model-server.log
 
+if [[ -f /opt/rosely-h3-zit-serverless/runtime.env ]]; then
+  # shellcheck disable=SC1091
+  source /opt/rosely-h3-zit-serverless/runtime.env
+fi
+
 : "${AWS_UNIFIED_ACCESS_KEY_ID:?AWS_UNIFIED_ACCESS_KEY_ID is required}"
 : "${AWS_UNIFIED_SECRET_ACCESS_KEY:?AWS_UNIFIED_SECRET_ACCESS_KEY is required}"
 : "${ROSELY_S3_BUCKET:=rosely-infrastructure}"
@@ -42,6 +47,10 @@ export ROSELY_ZIT_S3_ENDPOINT_URL="${ROSELY_S3_ENDPOINT_URL:-}"
 
 export ROSELY_H3_PRESIGNED_URL_EXPIRES_SECONDS="$ROSELY_PRESIGNED_URL_EXPIRES_SECONDS"
 export ROSELY_ZIT_PRESIGNED_URL_EXPIRES_SECONDS="$ROSELY_PRESIGNED_URL_EXPIRES_SECONDS"
+
+if [[ -n "${ROSELY_H3_MODEL_NAME:-}" ]]; then
+  export ROSELY_H3_MODEL_NAME
+fi
 
 source /venv/main/bin/activate
 cd /workspace/vast-pyworker

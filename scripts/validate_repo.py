@@ -16,13 +16,25 @@ def require(condition: bool, message: str) -> None:
         raise SystemExit(message)
 
 
-for py in [ROOT / "model_server.py", ROOT / "worker.py", ROOT / "zit_workflow.py"]:
+for py in [
+    ROOT / "model_server.py",
+    ROOT / "worker.py",
+    ROOT / "zit_workflow.py",
+    ROOT / "scripts/sync_models.py",
+    ROOT / "scripts/publish_direct_bundle.py",
+]:
     ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
-    print("AST OK", py.name)
+    print("AST OK", py.relative_to(ROOT))
 
 h3 = json.loads((ROOT / "workflows/minimax_h3_ref2va_api.json").read_text())
-require(h3["1"]["inputs"]["clip_name"] == "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "H3 encoder mismatch")
-require(h3["2"]["inputs"]["unet_name"] == "10Eros_Max_h3_hybrid_beta5_int8.safetensors", "H3 model mismatch")
+require(
+    h3["1"]["inputs"]["clip_name"] == "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+    "H3 encoder mismatch",
+)
+require(
+    h3["2"]["inputs"]["unet_name"] == "10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors",
+    "H3 model mismatch",
+)
 require(h3["17"]["class_type"] == "SaveVideo", "H3 SaveVideo missing")
 print("H3 workflow OK")
 
@@ -54,10 +66,11 @@ for mode in MODE_TO_FILE:
 print("All ZiT workflows OK")
 
 server_text = (ROOT / "model_server.py").read_text()
-for route in ["/generate/sync", "/generate/video", "/generate/image", "/health", "/ready"]:
+for route in ["/generate/sync", "/generate/video", "/generate/image", "/health", "/ready", "/status"]:
     require(route in server_text, f"Missing route {route}")
 require("generation_lock = asyncio.Lock()" in server_text, "Global generation lock missing")
 require("/free" in server_text, "ComfyUI family-switch cleanup missing")
+require("_wait_for_h3_ready" in server_text, "Background H3 wait helper missing")
 print("Server invariants OK")
 
 print("VALIDATION PASSED")

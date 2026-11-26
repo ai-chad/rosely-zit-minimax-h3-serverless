@@ -30,7 +30,8 @@ logging.basicConfig(
 logger = logging.getLogger("rosely-h3-zit")
 
 COMFY_URL = os.getenv("COMFY_URL", "http://127.0.0.1:18189").rstrip("/")
-APP_DIR = Path(os.getenv("APP_DIR", "/workspace/vast-pyworker"))
+APP_DIR = Path(os.getenv("APP_DIR", str(Path(__file__).resolve().parent)))
+STATE_DIR = Path(os.getenv("STATE_DIR", "/workspace/.rosely-h3-zit"))
 H3_WORKFLOW_PATH = Path(
     os.getenv(
         "H3_WORKFLOW_PATH",
@@ -41,8 +42,15 @@ INPUT_DIR = Path(os.getenv("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 OUTPUT_DIR = Path(os.getenv("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output"))
 MODEL_DIR = Path(os.getenv("COMFY_MODEL_DIR", "/workspace/ComfyUI/models"))
 
+H3_READY_MARKER = STATE_DIR / "h3.ready"
+H3_STATUS_FILE = STATE_DIR / "h3-download-status.json"
+ZIT_READY_MARKER = STATE_DIR / "zit.ready"
+ZIT_STATUS_FILE = STATE_DIR / "zit-download-status.json"
+
 VIDEO_GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "3600"))
 IMAGE_GENERATION_TIMEOUT = int(os.getenv("IMAGE_GENERATION_TIMEOUT_SECONDS", "900"))
+H3_DOWNLOAD_WAIT_TIMEOUT = float(os.getenv("H3_DOWNLOAD_WAIT_TIMEOUT_SECONDS", "900"))
+REQUIRE_H3_FOR_HEALTH = os.getenv("REQUIRE_H3_FOR_HEALTH", "false").lower() == "true"
 KEEP_LOCAL_OUTPUTS = os.getenv("KEEP_LOCAL_OUTPUTS", "false").lower() == "true"
 MAX_INPUT_IMAGE_BYTES = int(
     os.getenv("MAX_INPUT_IMAGE_BYTES", str(30 * 1024 * 1024))
@@ -57,20 +65,39 @@ FAMILY_SWITCH_SETTLE_SECONDS = float(
     os.getenv("FAMILY_SWITCH_SETTLE_SECONDS", "0.5")
 )
 
-H3_BASE_MODEL = "10Eros_Max_h3_hybrid_beta5_int8.safetensors"
-H3_TEXT_ENCODER = "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
-H3_VIDEO_VAE = "minimax_h3_video_vae_fp16.safetensors"
-H3_AUDIO_VAE = "minimax_h3_audio_vae_fp32.safetensors"
+H3_BASE_MODEL = os.getenv(
+    "ROSELY_H3_MODEL_NAME",
+    "10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors",
+).strip()
+H3_TEXT_ENCODER = os.getenv(
+    "ROSELY_H3_TEXT_ENCODER",
+    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+).strip()
+H3_VIDEO_VAE = os.getenv(
+    "ROSELY_H3_VIDEO_VAE",
+    "minimax_h3_video_vae_fp16.safetensors",
+).strip()
+H3_AUDIO_VAE = os.getenv(
+    "ROSELY_H3_AUDIO_VAE",
+    "minimax_h3_audio_vae_fp32.safetensors",
+).strip()
+H3_DEFAULT_SAMPLER = (
+    os.getenv("ROSELY_H3_DEFAULT_SAMPLER", "res_multistep").strip() or "res_multistep"
+)
+H3_FORCE_SAMPLER = os.getenv("ROSELY_H3_FORCE_SAMPLER", "").strip()
 
 ZIT_BASE_MODEL = "Zenith_13.0_MXFP8_E4M3.safetensors"
 ZIT_TEXT_ENCODER = "qwen/qwen_3_4b_fp8_mixed.safetensors"
 ZIT_VAE = "Flux/flux_vae.safetensors"
 
-EXPECTED_MODELS: dict[str, Path] = {
+EXPECTED_H3_MODELS: dict[str, Path] = {
     "h3_diffusion": MODEL_DIR / "diffusion_models" / H3_BASE_MODEL,
     "h3_text_encoder": MODEL_DIR / "text_encoders" / H3_TEXT_ENCODER,
     "h3_video_vae": MODEL_DIR / "vae" / H3_VIDEO_VAE,
     "h3_audio_vae": MODEL_DIR / "vae" / H3_AUDIO_VAE,
+}
+
+EXPECTED_ZIT_MODELS: dict[str, Path] = {
     "zit_diffusion": MODEL_DIR / "diffusion_models" / ZIT_BASE_MODEL,
     "zit_text_encoder": MODEL_DIR / "text_encoders" / ZIT_TEXT_ENCODER,
     "zit_vae": MODEL_DIR / "vae" / ZIT_VAE,
@@ -82,7 +109,29 @@ EXPECTED_MODELS: dict[str, Path] = {
     "zit_lora_anime_elusarca": MODEL_DIR / "loras/elusarca-anime-style.safetensors",
 }
 
-VALID_H3_SCHEDULERS = {"simple", "normal", "beta"}
+EXPECTED_MODELS: dict[str, Path] = {
+    **EXPECTED_H3_MODELS,
+    **EXPECTED_ZIT_MODELS,
+}
+
+VALID_H3_SCHEDULERS = {
+    "simple",
+    "normal",
+    "beta",
+    "sgm_uniform",
+    "beta57",
+    "karras",
+    "ddim_uniform",
+}
+VALID_H3_SAMPLERS = {
+    "res_multistep",
+    "lcm",
+    "euler",
+    "er_sde",
+    "dpmpp_2m",
+    "dpmpp_sde",
+    "uni_pc",
+}
 VALID_REF_IMAGE_SIZES = {"match", "max"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".webm", ".mov", ".mkv"}
@@ -130,6 +179,7 @@ generation_lock = asyncio.Lock()
 active_family: Literal["h3", "zit"] | None = None
 current_job_family: Literal["h3", "zit"] | None = None
 family_switch_count = 0
+h3_waiting_requests = 0
 
 
 async def comfy_health_monitor() -> None:
@@ -168,7 +218,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Rosely MiniMax H3 + Zenith/Z-Image RTX 5090 Server",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -185,8 +235,141 @@ def _payload(envelope: GenerateEnvelope) -> dict[str, Any]:
     return data
 
 
+def _read_download_status(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _missing_zit_models() -> list[str]:
+    return [name for name, path in EXPECTED_ZIT_MODELS.items() if not path.is_file()]
+
+
+def _missing_h3_models() -> list[str]:
+    return [name for name, path in EXPECTED_H3_MODELS.items() if not path.is_file()]
+
+
 def _missing_models() -> list[str]:
-    return [name for name, path in EXPECTED_MODELS.items() if not path.is_file()]
+    return _missing_h3_models() + _missing_zit_models()
+
+
+def _h3_availability() -> tuple[
+    Literal["available", "downloading", "failed", "missing"],
+    list[str],
+    dict[str, Any] | None,
+]:
+    missing = _missing_h3_models()
+    dl_info = _read_download_status(H3_STATUS_FILE)
+    dl_status = str(dl_info.get("status") or "").lower() if dl_info else ""
+
+    if not missing and (H3_READY_MARKER.is_file() or dl_status not in {"downloading", "failed"}):
+        return "available", [], dl_info
+    if dl_status == "failed":
+        return "failed", missing, dl_info
+    if dl_status == "downloading":
+        return "downloading", missing, dl_info
+    return "missing", missing, dl_info
+
+
+def _zit_availability() -> tuple[
+    Literal["available", "downloading", "failed", "missing"],
+    list[str],
+    dict[str, Any] | None,
+]:
+    missing = _missing_zit_models()
+    dl_info = _read_download_status(ZIT_STATUS_FILE)
+    dl_status = str(dl_info.get("status") or "").lower() if dl_info else ""
+
+    if not missing and (ZIT_READY_MARKER.is_file() or dl_status not in {"downloading", "failed"}):
+        return "available", [], dl_info
+    if dl_status == "failed":
+        return "failed", missing, dl_info
+    if dl_status == "downloading":
+        return "downloading", missing, dl_info
+    return "missing", missing, dl_info
+
+
+async def _wait_for_h3_ready(request_id: str) -> None:
+    global h3_waiting_requests
+    state, missing, dl_info = _h3_availability()
+    if state == "available":
+        return
+
+    if state == "failed":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "error",
+                "reason": "h3_model_download_failed",
+                "missing_models": missing,
+                "error": dl_info.get("error") if dl_info else None,
+            },
+        )
+
+    if state == "missing":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "reason": "h3_models_missing",
+                "missing_models": missing,
+            },
+        )
+
+    deadline = time.monotonic() + max(1.0, H3_DOWNLOAD_WAIT_TIMEOUT)
+    last_log = 0.0
+    h3_waiting_requests += 1
+    logger.info(
+        "request=%s waiting for background H3 model download (timeout=%.0fs)",
+        request_id,
+        H3_DOWNLOAD_WAIT_TIMEOUT,
+    )
+    try:
+        while time.monotonic() < deadline:
+            state, missing, dl_info = _h3_availability()
+            if state == "available":
+                logger.info(
+                    "request=%s H3 models ready; proceeding to video generation",
+                    request_id,
+                )
+                return
+            if state == "failed":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "status": "error",
+                        "reason": "h3_model_download_failed",
+                        "missing_models": missing,
+                        "error": dl_info.get("error") if dl_info else None,
+                    },
+                )
+            now = time.monotonic()
+            if now - last_log >= 15.0:
+                pct = dl_info.get("percent") if dl_info else None
+                logger.info(
+                    "request=%s still waiting for H3 download (state=%s percent=%s)",
+                    request_id,
+                    state,
+                    pct,
+                )
+                last_log = now
+            await asyncio.sleep(1.0)
+    finally:
+        h3_waiting_requests = max(0, h3_waiting_requests - 1)
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "status": "starting",
+            "reason": "h3_models_still_downloading",
+            "retryable": True,
+            "h3_download": dl_info,
+        },
+    )
 
 
 def _load_h3_workflow() -> dict[str, Any]:
@@ -220,19 +403,11 @@ def _load_h3_workflow() -> dict[str, Any]:
                 f"got {None if not node else node.get('class_type')}"
             )
 
-    expected_names = {
-        ("1", "clip_name"): H3_TEXT_ENCODER,
-        ("2", "unet_name"): H3_BASE_MODEL,
-        ("4", "vae_name"): H3_VIDEO_VAE,
-        ("5", "vae_name"): H3_AUDIO_VAE,
-    }
-    for (node_id, input_name), expected in expected_names.items():
-        actual = workflow[node_id]["inputs"].get(input_name)
-        if actual != expected:
-            raise RuntimeError(
-                f"H3 workflow {node_id}.{input_name}: "
-                f"expected {expected!r}, got {actual!r}"
-            )
+    # Apply configured H3 model filenames (defaults match workflows/minimax_h3_ref2va_api.json).
+    workflow["1"]["inputs"]["clip_name"] = H3_TEXT_ENCODER
+    workflow["2"]["inputs"]["unet_name"] = H3_BASE_MODEL
+    workflow["4"]["inputs"]["vae_name"] = H3_VIDEO_VAE
+    workflow["5"]["inputs"]["vae_name"] = H3_AUDIO_VAE
     return workflow
 
 
@@ -426,11 +601,21 @@ def _patch_h3_workflow(
     if steps < 4 or steps > 50:
         raise HTTPException(status_code=422, detail="steps must be between 4 and 50")
 
-    scheduler = str(data.get("scheduler", "simple"))
+    scheduler = str(data.get("scheduler", "simple")).strip()
     if scheduler not in VALID_H3_SCHEDULERS:
         raise HTTPException(
             status_code=422,
             detail=f"scheduler must be one of {sorted(VALID_H3_SCHEDULERS)}",
+        )
+
+    sampler = (
+        H3_FORCE_SAMPLER
+        or str(data.get("sampler") or data.get("sampler_name") or H3_DEFAULT_SAMPLER).strip()
+    )
+    if sampler not in VALID_H3_SAMPLERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"sampler must be one of {sorted(VALID_H3_SAMPLERS)}",
         )
 
     ref_image_size = str(data.get("ref_image_size", "match"))
@@ -467,6 +652,7 @@ def _patch_h3_workflow(
     workflow["11"]["inputs"].update(
         {"scheduler": scheduler, "steps": steps, "denoise": 1.0}
     )
+    workflow["12"]["inputs"]["sampler_name"] = sampler
     workflow["17"]["inputs"]["filename_prefix"] = (
         f"video/h3/{sanitize_request_id(request_id)}"
     )
@@ -486,7 +672,7 @@ def _patch_h3_workflow(
         "duration_seconds_actual": actual_duration,
         "steps": steps,
         "scheduler": scheduler,
-        "sampler": "res_multistep",
+        "sampler": sampler,
         "ref_image_size": ref_image_size,
         "include_audio": include_audio,
         "shift_video": shift_video,
@@ -771,11 +957,15 @@ async def _generate_video(data: dict[str, Any]) -> dict[str, Any]:
     output_path: Path | None = None
     prompt_id: str | None = None
 
+    # Validate output config and wait for background H3 sync WITHOUT holding
+    # generation_lock so ZiT image traffic continues unblocked during H3 download.
+    _output_config("h3")
+    await _wait_for_h3_ready(request_id)
+
     async with generation_lock:
         current_job_family = "h3"
         started = time.monotonic()
         try:
-            _output_config("h3")
             await _prepare_family("h3")
             image_name = await _download_input_image(data, request_id)
             workflow, generation_meta = _patch_h3_workflow(data, image_name, request_id)
@@ -839,6 +1029,18 @@ async def _generate_image(data: dict[str, Any]) -> dict[str, Any]:
     request_id = str(data.get("request_id") or f"zit_{uuid.uuid4().hex}")
     output_path: Path | None = None
     prompt_id: str | None = None
+
+    zit_state, missing_zit, _ = _zit_availability()
+    if zit_state != "available":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": "zit_models_not_ready",
+                "zit_state": zit_state,
+                "missing_models": missing_zit,
+            },
+        )
 
     if REJECT_IMAGE_WHILE_VIDEO_BUSY and generation_lock.locked() and current_job_family == "h3":
         raise HTTPException(
@@ -970,7 +1172,9 @@ def _infer_task_type(data: dict[str, Any]) -> Literal["image", "video"]:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    missing = _missing_models()
+    zit_state, missing_zit, _ = _zit_availability()
+    h3_state, missing_h3, h3_dl = _h3_availability()
+
     h3_bucket_ok = bool(
         os.getenv("ROSELY_H3_OUTPUT_BUCKET") or os.getenv("ROSELY_H3_S3_BUCKET")
     )
@@ -980,13 +1184,17 @@ async def health() -> dict[str, Any]:
         or os.getenv("ROSELY_H3_OUTPUT_BUCKET")
         or os.getenv("ROSELY_H3_S3_BUCKET")
     )
-    if missing or not h3_bucket_ok or not zit_bucket_ok:
+
+    h3_blocks_health = REQUIRE_H3_FOR_HEALTH and h3_state != "available"
+    if zit_state != "available" or h3_blocks_health or not h3_bucket_ok or not zit_bucket_ok:
         raise HTTPException(
             status_code=503,
             detail={
                 "status": "unhealthy",
                 "reason": "local prerequisites missing",
-                "missing_models": missing,
+                "missing_models": missing_zit + (missing_h3 if h3_blocks_health else []),
+                "models": {"h3": h3_state, "zit": zit_state},
+                "h3_download": h3_dl,
                 "h3_s3_output_configured": h3_bucket_ok,
                 "zit_s3_output_configured": zit_bucket_ok,
             },
@@ -1025,7 +1233,9 @@ async def health() -> dict[str, Any]:
         "current_job_family": current_job_family,
         "gpu_busy": generation_lock.locked(),
         "family_switch_count": family_switch_count,
-        "models": {"h3": "available", "zit": "available"},
+        "h3_model": H3_BASE_MODEL,
+        "models": {"h3": h3_state, "zit": zit_state},
+        "h3_download": h3_dl,
         "routes": ["/generate/sync", "/generate/video", "/generate/image"],
         "last_comfy_success_seconds_ago": round(age, 2),
         "last_probe_error": comfy_health.last_error,
@@ -1034,11 +1244,18 @@ async def health() -> dict[str, Any]:
 
 @app.get("/ready")
 async def ready() -> dict[str, Any]:
-    missing = _missing_models()
-    if missing:
+    zit_state, missing_zit, _ = _zit_availability()
+    h3_state, missing_h3, h3_dl = _h3_availability()
+    h3_blocks = REQUIRE_H3_FOR_HEALTH and h3_state != "available"
+    if zit_state != "available" or h3_blocks:
         raise HTTPException(
             status_code=503,
-            detail={"status": "not_ready", "missing_models": missing},
+            detail={
+                "status": "not_ready",
+                "missing_models": missing_zit + (missing_h3 if h3_blocks else []),
+                "models": {"h3": h3_state, "zit": zit_state},
+                "h3_download": h3_dl,
+            },
         )
     timeout = httpx.Timeout(connect=1.0, read=5.0, write=1.0, pool=1.0)
     try:
@@ -1051,7 +1268,9 @@ async def ready() -> dict[str, Any]:
             "comfyui": "ready",
             "active_family": active_family,
             "gpu_busy": generation_lock.locked(),
-            "models": {"h3": "available", "zit": "available"},
+            "h3_model": H3_BASE_MODEL,
+            "models": {"h3": h3_state, "zit": zit_state},
+            "h3_download": h3_dl,
         }
     except Exception as exc:
         comfy_health.mark_failure(f"{type(exc).__name__}: {exc}")
@@ -1063,6 +1282,8 @@ async def ready() -> dict[str, Any]:
 
 @app.get("/status")
 async def status() -> dict[str, Any]:
+    zit_state, missing_zit, zit_dl = _zit_availability()
+    h3_state, missing_h3, h3_dl = _h3_availability()
     return {
         "active_family": active_family,
         "current_job_family": current_job_family,
@@ -1070,6 +1291,13 @@ async def status() -> dict[str, Any]:
         "family_switch_count": family_switch_count,
         "free_on_family_switch": FREE_ON_FAMILY_SWITCH,
         "reject_image_while_video_busy": REJECT_IMAGE_WHILE_VIDEO_BUSY,
+        "h3_model": H3_BASE_MODEL,
+        "h3_default_sampler": H3_FORCE_SAMPLER or H3_DEFAULT_SAMPLER,
+        "models": {"h3": h3_state, "zit": zit_state},
+        "missing_models": {"h3": missing_h3, "zit": missing_zit},
+        "h3_waiting_requests": h3_waiting_requests,
+        "h3_download": h3_dl,
+        "zit_download": zit_dl,
     }
 
 

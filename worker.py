@@ -82,30 +82,48 @@ _benchmark_worker_id = (
     or "worker"
 )
 
-# Vast recommends exactly one BenchmarkConfig across a multi-handler worker.
-# Keep the already-tested tiny H3 benchmark on the compatibility /generate/sync
-# route so video capacity remains calibrated while ZiT remains overflow traffic.
-benchmark_dataset = [
-    {
-        "input": {
-            "task_type": "video",
-            "request_id": f"vast-benchmark-h3-zit-{_benchmark_worker_id}",
-            "input_image_base64": _benchmark_image(),
-            "prompt": (
-                "Preserve <Picture 1>. Tiny natural head movement, stable camera, "
-                "coherent identity and geometry."
-            ),
-            "width": 256,
-            "height": 256,
-            "length": 5,
-            "steps": 4,
-            "scheduler": "simple",
-            "ref_image_size": "match",
-            "include_audio": False,
-            "seed": 12345,
+_benchmark_family = os.getenv("ROSELY_BENCHMARK_FAMILY", "zit").strip().lower()
+
+# Default to a tiny ZiT image benchmark so Vast Serverless marks the worker
+# READY in ~60-90s while H3 video weights finish syncing in the background.
+# Set ROSELY_BENCHMARK_FAMILY=h3 to revert to the legacy H3 video benchmark.
+if _benchmark_family == "h3":
+    benchmark_dataset = [
+        {
+            "input": {
+                "task_type": "video",
+                "request_id": f"vast-benchmark-h3-zit-{_benchmark_worker_id}",
+                "input_image_base64": _benchmark_image(),
+                "prompt": (
+                    "Preserve <Picture 1>. Tiny natural head movement, stable camera, "
+                    "coherent identity and geometry."
+                ),
+                "width": 256,
+                "height": 256,
+                "length": 5,
+                "steps": 4,
+                "scheduler": "simple",
+                "ref_image_size": "match",
+                "include_audio": False,
+                "seed": 12345,
+            }
         }
-    }
-]
+    ]
+else:
+    benchmark_dataset = [
+        {
+            "input": {
+                "task_type": "image",
+                "request_id": f"vast-benchmark-zit-{_benchmark_worker_id}",
+                "mode": "realistic",
+                "prompt": "minimalist studio portrait, soft neutral daylight",
+                "width": 512,
+                "height": 512,
+                "steps": 4,
+                "seed": 12345,
+            }
+        }
+    ]
 
 worker_config = WorkerConfig(
     model_server_url=MODEL_SERVER_URL,
