@@ -45,9 +45,9 @@ def sha256_file(path: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Upload per-file S3 model bundle + manifest.json")
-    parser.add_argument("--family", choices=["h3", "zit"], required=True)
+    parser.add_argument("--family", choices=["h3", "zit", "voice"], required=True)
     parser.add_argument("--bundle-name", required=True)
-    parser.add_argument("--source-dir", required=True, help="Directory whose relative paths map under ComfyUI/models/")
+    parser.add_argument("--source-dir", required=True, help="Directory whose relative paths map under target root (ComfyUI/models/ or VOICE_BUNDLE_ROOT)")
     parser.add_argument("--bucket", default="rosely-infrastructure")
     parser.add_argument("--s3-prefix", required=True, help="Target S3 folder, e.g. models/minimax-h3/beta7_sulpher3")
     parser.add_argument("--region", default="us-east-1")
@@ -63,6 +63,10 @@ def priority_for(family: str, rel: str) -> int:
     # Lower priority number downloads first.
     if family == "zit":
         if rel.startswith(("diffusion_models/", "text_encoders/", "vae/", "loras/")):
+            return 1
+        return 2
+    if family == "voice":
+        if rel.startswith(("models/Qwen3-ASR-0.6B/", "models/chatterbox-turbo/", "voices/", "manifest/", "source/")):
             return 1
         return 2
     return 1

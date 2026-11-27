@@ -313,10 +313,12 @@ def _finalize_seedvr2_layout(models_root: Path, entries: list[dict[str, Any]] | 
 
 def _sync_direct_manifest(args: argparse.Namespace) -> None:
     family = args.family
-    models_root = Path(args.comfy_dir) / "models"
+    dest_root_arg = getattr(args, "dest_root", "") or ""
+    models_root = Path(dest_root_arg) if dest_root_arg.strip() else (Path(args.comfy_dir) / "models")
     state_dir = Path(args.state_dir)
     staging_root = state_dir / f"{family}-staging"
-    ready_marker = state_dir / f"{family}.ready"
+    ready_marker_arg = getattr(args, "ready_marker", "") or ""
+    ready_marker = Path(ready_marker_arg) if ready_marker_arg.strip() else (state_dir / f"{family}.ready")
     status_path = state_dir / f"{family}-download-status.json"
 
     models_root.mkdir(parents=True, exist_ok=True)
@@ -652,8 +654,8 @@ def _sync_legacy_archive(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sync Rosely H3 or ZiT models from S3")
-    parser.add_argument("--family", choices=["zit", "h3"], required=True)
+    parser = argparse.ArgumentParser(description="Sync Rosely H3, ZiT, or Voice models from S3")
+    parser.add_argument("--family", choices=["zit", "h3", "voice"], required=True)
     parser.add_argument("--bucket", required=True)
     parser.add_argument("--model-key", required=True)
     parser.add_argument("--checksum-key", default="")
@@ -662,6 +664,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--endpoint-url", default="")
     parser.add_argument("--comfy-dir", default="/workspace/ComfyUI")
+    parser.add_argument("--dest-root", default="", help="Override target directory (default: <comfy-dir>/models)")
+    parser.add_argument("--ready-marker", default="", help="Override ready marker path (default: <state-dir>/<family>.ready)")
     parser.add_argument("--state-dir", default="/workspace/.rosely-h3-zit")
     parser.add_argument("--concurrency", type=int, default=16)
     parser.add_argument("--chunk-mib", type=int, default=32)

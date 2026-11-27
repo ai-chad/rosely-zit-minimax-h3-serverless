@@ -67,6 +67,15 @@ MIN_CUDA_CAPABILITY="${MIN_CUDA_CAPABILITY:-8.9}"
 INSTALL_ZIT_OPTIONAL_NODES="${ROSELY_INSTALL_ZIT_OPTIONAL_NODES:-true}"
 INSTALL_SAM2="${ROSELY_INSTALL_SAM2:-false}"
 WAIT_FOR_H3_DURING_PROVISION="${ROSELY_WAIT_FOR_H3_DURING_PROVISION:-false}"
+ENABLE_VOICE="${ROSELY_ENABLE_VOICE:-true}"
+WAIT_FOR_VOICE_DURING_PROVISION="${ROSELY_WAIT_FOR_VOICE_DURING_PROVISION:-false}"
+VOICE_REPO="${ROSELY_VOICE_REPO:-https://github.com/ai-chad/rosely-vast-voice-avatar.git}"
+VOICE_REF="${ROSELY_VOICE_REF:-main}"
+VOICE_BUNDLE_ROOT="${ROSELY_VOICE_BUNDLE_ROOT:-/workspace/rosely-voice-v1}"
+VOICE_APP_DIR="${ROSELY_VOICE_APP_DIR:-/workspace/rosely-vast-voice-avatar}"
+VOICE_VRAM_MODE="${ROSELY_VOICE_VRAM_MODE:-auto}"
+LIVE_CALL_ENABLED="${ROSELY_LIVE_CALL_ENABLED:-${LIVE_CALL_ENABLED:-1}}"
+DITTO_SOURCE_CACHE_DISK_GB="${DITTO_SOURCE_CACHE_DISK_GB:-10}"
 
 DEFAULT_H3_MODEL_NAME="10Eros_Max_8stepTurbo_v1.0_hybrid-int8_HQ.safetensors"
 H3_MODEL_NAME="${ROSELY_H3_MODEL_NAME:-$DEFAULT_H3_MODEL_NAME}"
@@ -76,6 +85,9 @@ DEFAULT_H3_MANIFEST_SHA="45ad09171573a127d7388e6ab22ed0852069bc1046d5931bb821579
 
 DEFAULT_ZIT_MANIFEST_KEY="serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3-direct/manifest.json"
 DEFAULT_ZIT_MANIFEST_SHA="14b308d29489719b09beeff9708e6961537319eadc02cdac4f94b68da47fd6d4"
+
+DEFAULT_VOICE_MANIFEST_KEY="models/voice-avatar/rosely-voice-ditto-v1/manifest.json"
+DEFAULT_VOICE_MANIFEST_SHA="334a6170d549cae722100b49cfdd716e0d59882d90fd6d68c9e59e22704e4421"
 LEGACY_ZIT_ARCHIVE_KEY="serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3.tar.zst"
 LEGACY_ZIT_ARCHIVE_SHA="cfbd87e06b3b570c40c1436bea5cb31c0b1c70b772254d13791162f41df64fb7"
 LEGACY_ZIT_ARCHIVE_SIZE="16309405103"
@@ -105,10 +117,18 @@ if [[ "$ZIT_EXPECTED_SIZE" == "0" && "$ZIT_MODEL_KEY" == "$LEGACY_ZIT_ARCHIVE_KE
   ZIT_EXPECTED_SIZE="$LEGACY_ZIT_ARCHIVE_SIZE"
 fi
 
+VOICE_MODEL_KEY="${ROSELY_VOICE_MODEL_KEY:-$DEFAULT_VOICE_MANIFEST_KEY}"
+VOICE_CHECKSUM_KEY="${ROSELY_VOICE_MODEL_CHECKSUM_KEY:-${VOICE_MODEL_KEY}.sha256}"
+VOICE_EXPECTED_SHA="${ROSELY_VOICE_EXPECTED_SHA256:-}"
+if [[ -z "$VOICE_EXPECTED_SHA" && "$VOICE_MODEL_KEY" == "$DEFAULT_VOICE_MANIFEST_KEY" && "$DEFAULT_VOICE_MANIFEST_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+  VOICE_EXPECTED_SHA="$DEFAULT_VOICE_MANIFEST_SHA"
+fi
+
 DOWNLOAD_CONCURRENCY="${ROSELY_MODEL_DOWNLOAD_CONCURRENCY:-16}"
 DOWNLOAD_CHUNK_MIB="${ROSELY_MODEL_DOWNLOAD_CHUNK_MIB:-32}"
 ZIT_FILE_WORKERS="${ROSELY_ZIT_FILE_WORKERS:-4}"
 H3_FILE_WORKERS="${ROSELY_H3_FILE_WORKERS:-3}"
+VOICE_FILE_WORKERS="${ROSELY_VOICE_FILE_WORKERS:-4}"
 
 mkdir -p "$STATE_DIR"
 
@@ -138,9 +158,14 @@ ensure_system_packages() {
   command -v git >/dev/null 2>&1 || packages+=(git)
   command -v jq >/dev/null 2>&1 || packages+=(jq)
   command -v zstd >/dev/null 2>&1 || packages+=(zstd)
+  command -v openssl >/dev/null 2>&1 || packages+=(openssl)
+  command -v sox >/dev/null 2>&1 || packages+=(sox)
   command -v supervisorctl >/dev/null 2>&1 || packages+=(supervisor)
   dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -q 'install ok installed' || packages+=(ca-certificates)
   dpkg-query -W -f='${Status}' libgl1 2>/dev/null | grep -q 'install ok installed' || packages+=(libgl1)
+  dpkg-query -W -f='${Status}' libsndfile1 2>/dev/null | grep -q 'install ok installed' || packages+=(libsndfile1)
+  dpkg-query -W -f='${Status}' libsox-fmt-all 2>/dev/null | grep -q 'install ok installed' || packages+=(libsox-fmt-all)
+  dpkg-query -W -f='${Status}' libgomp1 2>/dev/null | grep -q 'install ok installed' || packages+=(libgomp1)
   if ! dpkg-query -W -f='${Status}' libglib2.0-0t64 2>/dev/null | grep -q 'install ok installed'; then
     if apt-cache show libglib2.0-0t64 >/dev/null 2>&1; then
       packages+=(libglib2.0-0t64)
@@ -343,6 +368,18 @@ write_runtime_env() {
 : "\${ROSELY_MODEL_DOWNLOAD_CONCURRENCY:=${DOWNLOAD_CONCURRENCY}}"
 : "\${ROSELY_MODEL_DOWNLOAD_CHUNK_MIB:=${DOWNLOAD_CHUNK_MIB}}"
 : "\${ROSELY_H3_FILE_WORKERS:=${H3_FILE_WORKERS}}"
+: "\${ROSELY_ENABLE_VOICE:=${ENABLE_VOICE}}"
+: "\${ROSELY_VOICE_REPO:=${VOICE_REPO}}"
+: "\${ROSELY_VOICE_REF:=${VOICE_REF}}"
+: "\${ROSELY_VOICE_BUNDLE_ROOT:=${VOICE_BUNDLE_ROOT}}"
+: "\${ROSELY_VOICE_APP_DIR:=${VOICE_APP_DIR}}"
+: "\${ROSELY_VOICE_MODEL_KEY:=${VOICE_MODEL_KEY}}"
+: "\${ROSELY_VOICE_MODEL_CHECKSUM_KEY:=${VOICE_CHECKSUM_KEY}}"
+: "\${ROSELY_VOICE_EXPECTED_SHA256:=${VOICE_EXPECTED_SHA}}"
+: "\${ROSELY_VOICE_FILE_WORKERS:=${VOICE_FILE_WORKERS}}"
+: "\${ROSELY_VOICE_VRAM_MODE:=${VOICE_VRAM_MODE}}"
+: "\${ROSELY_LIVE_CALL_ENABLED:=${LIVE_CALL_ENABLED}}"
+: "\${DITTO_SOURCE_CACHE_DISK_GB:=${DITTO_SOURCE_CACHE_DISK_GB}}"
 EOF
   chmod 0644 "$env_file"
 }
@@ -355,6 +392,7 @@ log "Provisioning START mode=${MODEL_BUNDLE_MODE} repo=${PYWORKER_REPO}@${PYWORK
 log "Shared S3 bucket=${ROSELY_S3_BUCKET} region=${ROSELY_S3_REGION}"
 log "ZiT artifact=${ZIT_MODEL_KEY}"
 log "H3  artifact=${H3_MODEL_KEY} (model=${H3_MODEL_NAME})"
+log "Voice enabled=${ENABLE_VOICE} artifact=${VOICE_MODEL_KEY} (vram_mode=${VOICE_VRAM_MODE} live=${LIVE_CALL_ENABLED})"
 
 ensure_system_packages
 [[ -f /venv/main/bin/activate ]] || fail "/venv/main missing; use a recent Vast PyTorch CUDA image with RTX 5090/Blackwell support"
@@ -454,8 +492,25 @@ if [[ ! -f "$STATE_DIR/h3.ready" ]]; then
 EOF
 fi
 
-log "Phase 2: Starting shared ComfyUI, model server (ZiT live), and background H3 model sync"
-for service in api-wrapper comfyui h3-comfyui h3-model-server rosely-comfyui rosely-h3-sync rosely-model-server; do
+if [[ "$ENABLE_VOICE" == "true" && ! -f "$STATE_DIR/voice.ready" ]]; then
+  cat > "$STATE_DIR/voice-download-status.json" <<EOF
+{
+  "family": "voice",
+  "mode": "direct_manifest",
+  "status": "downloading",
+  "stage": "queued",
+  "model_key": "${VOICE_MODEL_KEY}",
+  "percent": 0.0,
+  "started_at": "$(date -Iseconds)",
+  "updated_at": "$(date -Iseconds)",
+  "finished_at": null,
+  "error": null
+}
+EOF
+fi
+
+log "Phase 2: Starting shared ComfyUI, model server (ZiT live), and background H3 + Voice sync"
+for service in api-wrapper comfyui h3-comfyui h3-model-server rosely-comfyui rosely-h3-sync rosely-voice-sync rosely-model-server; do
   supervisorctl stop "$service" >/dev/null 2>&1 || true
 done
 for config in /etc/supervisor/conf.d/api-wrapper.conf /etc/supervisor/conf.d/comfyui.conf /etc/supervisor/conf.d/h3-services.conf; do
@@ -467,6 +522,8 @@ supervisorctl update >/dev/null 2>&1 || true
 mkdir -p /opt/rosely-h3-zit-serverless
 cp "$APP_DIR/scripts/start_comfyui.sh" /opt/rosely-h3-zit-serverless/
 cp "$APP_DIR/scripts/start_h3_sync.sh" /opt/rosely-h3-zit-serverless/
+cp "$APP_DIR/scripts/start_voice_sync.sh" /opt/rosely-h3-zit-serverless/
+cp "$APP_DIR/scripts/voice_ctl.sh" /opt/rosely-h3-zit-serverless/
 cp "$APP_DIR/scripts/start_model_server.sh" /opt/rosely-h3-zit-serverless/
 cp "$APP_DIR/scripts/status.sh" /opt/rosely-h3-zit-serverless/
 chmod +x /opt/rosely-h3-zit-serverless/*.sh
@@ -476,6 +533,7 @@ supervisorctl reread
 supervisorctl update
 supervisorctl start rosely-comfyui >/dev/null 2>&1 || true
 supervisorctl start rosely-h3-sync >/dev/null 2>&1 || true
+supervisorctl start rosely-voice-sync >/dev/null 2>&1 || true
 supervisorctl start rosely-model-server >/dev/null 2>&1 || true
 
 log "Waiting for shared ComfyUI"
@@ -520,10 +578,23 @@ if [[ "$WAIT_FOR_H3_DURING_PROVISION" == "true" ]]; then
   log "H3 models verified and ready"
 fi
 
+if [[ "$WAIT_FOR_VOICE_DURING_PROVISION" == "true" && "$ENABLE_VOICE" == "true" ]]; then
+  log "ROSELY_WAIT_FOR_VOICE_DURING_PROVISION=true: waiting for Voice Avatar background bootstrap to finish"
+  while [[ ! -f "$STATE_DIR/voice.ready" ]]; do
+    st=$(jq -r '.status // "downloading"' "$STATE_DIR/voice-download-status.json" 2>/dev/null || echo "downloading")
+    if [[ "$st" == "failed" ]]; then
+      tail -120 /var/log/portal/voice-model-sync.log || true
+      fail "Voice Avatar background bootstrap failed"
+    fi
+    sleep 3
+  done
+  log "Voice Avatar models and environments verified and ready"
+fi
+
 ELAPSED=$(( $(date +%s) - PROV_START ))
-log "PROVISIONING COMPLETE in ${ELAPSED}s (ZiT LIVE; H3 background sync active/ready)"
-supervisorctl status rosely-comfyui rosely-h3-sync rosely-model-server || true
+log "PROVISIONING COMPLETE in ${ELAPSED}s (ZiT LIVE; H3 + Voice background sync active/ready)"
+supervisorctl status rosely-comfyui rosely-h3-sync rosely-voice-sync rosely-model-server || true
 curl -fsS http://127.0.0.1:18288/health | jq . || true
 nvidia-smi || true
 df -h /workspace
-log "Logs: /var/log/portal/combined-provision.log, /var/log/portal/zit-model-sync.log, /var/log/portal/h3-model-sync.log"
+log "Logs: /var/log/portal/combined-provision.log, /var/log/portal/zit-model-sync.log, /var/log/portal/h3-model-sync.log, /var/log/portal/voice-model-sync.log"

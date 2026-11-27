@@ -8,6 +8,8 @@ PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || command -v python)}"
 bash -n provision.sh
 bash -n scripts/start_comfyui.sh
 bash -n scripts/start_h3_sync.sh
+bash -n scripts/start_voice_sync.sh
+bash -n scripts/voice_ctl.sh
 bash -n scripts/start_model_server.sh
 bash -n scripts/status.sh
 bash -n scripts/build_combined_bundle.sh

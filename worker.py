@@ -155,6 +155,36 @@ worker_config = WorkerConfig(
             max_queue_time=900.0,
             workload_calculator=_image_workload,
         ),
+        HandlerConfig(
+            route="/v1/tts",
+            allow_parallel_requests=False,
+            max_queue_time=180.0,
+            workload_calculator=lambda payload: 1.0,
+        ),
+        HandlerConfig(
+            route="/v1/stt",
+            allow_parallel_requests=False,
+            max_queue_time=180.0,
+            workload_calculator=lambda payload: 1.0,
+        ),
+        HandlerConfig(
+            route="/v1/avatar/generate",
+            allow_parallel_requests=False,
+            max_queue_time=900.0,
+            workload_calculator=lambda payload: 20.0,
+        ),
+        HandlerConfig(
+            route="/v1/ditto/warm",
+            allow_parallel_requests=False,
+            max_queue_time=300.0,
+            workload_calculator=lambda payload: 5.0,
+        ),
+        HandlerConfig(
+            route="/v1/live/join",
+            allow_parallel_requests=False,
+            max_queue_time=30.0,
+            workload_calculator=lambda payload: 1.0,
+        ),
     ],
     log_action_config=LogActionConfig(
         on_load=MODEL_LOAD_LOG_MSGS,

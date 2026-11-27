@@ -30,7 +30,14 @@ class StagedReadinessTests(unittest.TestCase):
         self.orig_h3_status = model_server.H3_STATUS_FILE
         self.orig_zit_ready = model_server.ZIT_READY_MARKER
         self.orig_zit_status = model_server.ZIT_STATUS_FILE
+        self.orig_voice_ready = model_server.VOICE_READY_MARKER
+        self.orig_voice_status = model_server.VOICE_STATUS_FILE
+        self.orig_voice_env = model_server.VOICE_ENV_FILE
+        self.orig_voice_enabled = model_server.VOICE_ENABLED
+        self.orig_voice_vram_mode = model_server.VOICE_VRAM_MODE_RAW
         self.orig_require_h3 = model_server.REQUIRE_H3_FOR_HEALTH
+        self.orig_require_voice = model_server.REQUIRE_VOICE_FOR_HEALTH
+        self.orig_active_family = model_server.active_family
 
         model_server.EXPECTED_ZIT_MODELS = {
             name: self.model_dir / path.relative_to(model_server.MODEL_DIR)
@@ -44,7 +51,14 @@ class StagedReadinessTests(unittest.TestCase):
         model_server.H3_STATUS_FILE = self.state_dir / "h3-download-status.json"
         model_server.ZIT_READY_MARKER = self.state_dir / "zit.ready"
         model_server.ZIT_STATUS_FILE = self.state_dir / "zit-download-status.json"
+        model_server.VOICE_READY_MARKER = self.state_dir / "voice.ready"
+        model_server.VOICE_STATUS_FILE = self.state_dir / "voice-download-status.json"
+        model_server.VOICE_ENV_FILE = self.state_dir / "rosely-voice-avatar.env"
+        model_server.VOICE_ENABLED = True
+        model_server.VOICE_VRAM_MODE_RAW = "switch"
         model_server.REQUIRE_H3_FOR_HEALTH = False
+        model_server.REQUIRE_VOICE_FOR_HEALTH = False
+        model_server.active_family = None
 
         for p in model_server.EXPECTED_ZIT_MODELS.values():
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -59,7 +73,14 @@ class StagedReadinessTests(unittest.TestCase):
         model_server.H3_STATUS_FILE = self.orig_h3_status
         model_server.ZIT_READY_MARKER = self.orig_zit_ready
         model_server.ZIT_STATUS_FILE = self.orig_zit_status
+        model_server.VOICE_READY_MARKER = self.orig_voice_ready
+        model_server.VOICE_STATUS_FILE = self.orig_voice_status
+        model_server.VOICE_ENV_FILE = self.orig_voice_env
+        model_server.VOICE_ENABLED = self.orig_voice_enabled
+        model_server.VOICE_VRAM_MODE_RAW = self.orig_voice_vram_mode
         model_server.REQUIRE_H3_FOR_HEALTH = self.orig_require_h3
+        model_server.REQUIRE_VOICE_FOR_HEALTH = self.orig_require_voice
+        model_server.active_family = self.orig_active_family
         self._tmp.cleanup()
 
     def _populate_h3(self) -> None:
@@ -258,6 +279,149 @@ class StagedReadinessTests(unittest.TestCase):
             cache["seedvr2_ema_7b-Q4_K_M.gguf"]["hash"],
             "db9cb2ad90ebd40d2e8c29da2b3fc6fd03ba87cd58cbadceccca13ad27162789",
         )
+
+    def test_health_ok_while_h3_and_voice_bootstrapping(self) -> None:
+        model_server.H3_STATUS_FILE.write_text(
+            json.dumps({"status": "downloading", "percent": 25.0}), encoding="utf-8"
+        )
+        model_server.VOICE_STATUS_FILE.write_text(
+            json.dumps({"status": "installing", "stage": "installing_ditto_env", "percent": 88.0}),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(os.environ, {"ROSELY_H3_OUTPUT_BUCKET": "rosely-infrastructure"}):
+            res = asyncio.run(model_server.health())
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["models"], {"h3": "downloading", "zit": "available", "voice": "installing"})
+        self.assertIn("/v1/tts", res["routes"])
+        self.assertIn("/v1/avatar/generate", res["routes"])
+
+    def test_wait_for_voice_succeeds_without_holding_lock(self) -> None:
+        model_server.VOICE_STATUS_FILE.write_text(
+            json.dumps({"status": "installing", "percent": 75.0}), encoding="utf-8"
+        )
+
+        async def run() -> None:
+            waiter = asyncio.create_task(model_server._wait_for_voice_ready("/v1/tts"))
+            await asyncio.sleep(0.05)
+            self.assertFalse(model_server.generation_lock.locked())
+            self.assertEqual(model_server.voice_waiting_requests, 1)
+            model_server.VOICE_READY_MARKER.write_text("family=voice\n", encoding="utf-8")
+            model_server.VOICE_STATUS_FILE.write_text(
+                json.dumps({"status": "ready", "percent": 100.0}), encoding="utf-8"
+            )
+            await waiter
+
+        asyncio.run(run())
+        self.assertEqual(model_server.voice_waiting_requests, 0)
+        state, _ = model_server._voice_availability()
+        self.assertEqual(state, "available")
+
+    def test_voice_env_key_loaded_dynamically_and_live_call_blocks_comfy(self) -> None:
+        model_server.VOICE_ENV_FILE.write_text(
+            "VOICE_API_KEY=abc\nGATEWAY_API_KEY=secret_dyn_123\n", encoding="utf-8"
+        )
+        with mock.patch.dict(os.environ, {"GATEWAY_API_KEY": ""}, clear=False):
+            self.assertEqual(model_server._read_voice_gateway_key(), "secret_dyn_123")
+
+        with mock.patch.object(model_server, "_is_live_call_active", return_value=True):
+            with self.assertRaises(model_server.HTTPException) as ctx:
+                asyncio.run(model_server._prepare_family("h3"))
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertEqual(ctx.exception.detail["reason"], "live_call_in_progress")
+
+    def test_switch_mode_stops_voice_when_returning_to_zit_and_frees_comfy_for_voice(self) -> None:
+        calls: list[str] = []
+
+        async def fake_free(reason: str) -> None:
+            calls.append(f"free:{reason}")
+
+        async def fake_ctl(action: str, timeout_s: float) -> None:
+            calls.append(f"ctl:{action}")
+
+        gw_running = False
+
+        async def fake_gw_healthy() -> bool:
+            return gw_running
+
+        async def run() -> None:
+            nonlocal gw_running
+            model_server.active_family = "zit"
+            with (
+                mock.patch.object(model_server, "_free_comfy_memory", side_effect=fake_free),
+                mock.patch.object(model_server, "_run_voice_ctl", side_effect=fake_ctl),
+                mock.patch.object(model_server, "_is_live_call_active", return_value=False),
+                mock.patch.object(model_server, "_voice_gateway_healthy", side_effect=[False, True, True]),
+            ):
+                await model_server._prepare_family("voice")
+                self.assertEqual(model_server.active_family, "voice")
+                await model_server._prepare_family("h3")
+                self.assertEqual(model_server.active_family, "h3")
+
+        asyncio.run(run())
+        self.assertEqual(calls, ["free:family_switch=zit->voice", "ctl:start", "ctl:stop"])
+
+    def test_sync_direct_manifest_supports_dest_root_and_ready_marker_for_voice(self) -> None:
+        dest_root = self.root / "rosely-voice-v1"
+        state_dir = self.root / "voice_sync_state"
+        payload = b"wav-voice-bytes" * 64
+        sha = hashlib.sha256(payload).hexdigest()
+        manifest = {
+            "schema_version": 1,
+            "family": "voice",
+            "bundle_name": "rosely-voice-ditto-v1",
+            "s3_prefix": "models/voice-avatar/rosely-voice-ditto-v1/files",
+            "files": [
+                {
+                    "path": "voices/en_female_original.wav",
+                    "s3_key": "models/voice-avatar/rosely-voice-ditto-v1/files/voices/en_female_original.wav",
+                    "size": len(payload),
+                    "sha256": sha,
+                    "priority": 1,
+                }
+            ],
+        }
+        manifest_bytes = json.dumps(manifest).encode("utf-8")
+        manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+        objects = {
+            "models/voice-avatar/rosely-voice-ditto-v1/manifest.json": manifest_bytes,
+            "models/voice-avatar/rosely-voice-ditto-v1/manifest.json.sha256": f"{manifest_sha}  manifest.json\n".encode(),
+            "models/voice-avatar/rosely-voice-ditto-v1/files/voices/en_female_original.wav": payload,
+        }
+
+        class FakeS3:
+            def get_object(self, Bucket: str, Key: str):
+                return {"Body": io.BytesIO(objects[Key])}
+
+            def download_file(self, Bucket: str, Key: str, Filename: str, Config=None, Callback=None):
+                data = objects[Key]
+                Path(Filename).write_bytes(data)
+                if Callback:
+                    Callback(len(data))
+
+        custom_marker = state_dir / "voice-models.ready"
+        args = SimpleNamespace(
+            family="voice",
+            bucket="rosely-infrastructure",
+            model_key="models/voice-avatar/rosely-voice-ditto-v1/manifest.json",
+            checksum_key="models/voice-avatar/rosely-voice-ditto-v1/manifest.json.sha256",
+            expected_sha256=manifest_sha,
+            expected_size=0,
+            region="us-east-1",
+            endpoint_url="",
+            comfy_dir=str(self.root / "ComfyUI"),
+            dest_root=str(dest_root),
+            ready_marker=str(custom_marker),
+            state_dir=str(state_dir),
+            concurrency=4,
+            chunk_mib=16,
+            file_workers=1,
+            retries=1,
+        )
+        with mock.patch.object(sync_models, "_build_s3_client", return_value=FakeS3()):
+            sync_models._sync_direct_manifest(args)
+        self.assertEqual((dest_root / "voices/en_female_original.wav").read_bytes(), payload)
+        self.assertTrue(custom_marker.is_file())
+        self.assertFalse((state_dir / "voice.ready").exists())
 
 
 if __name__ == "__main__":

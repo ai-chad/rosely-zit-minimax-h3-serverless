@@ -52,6 +52,13 @@ if [[ -n "${ROSELY_H3_MODEL_NAME:-}" ]]; then
   export ROSELY_H3_MODEL_NAME
 fi
 
+export ROSELY_ENABLE_VOICE="${ROSELY_ENABLE_VOICE:-true}"
+export ROSELY_VOICE_VRAM_MODE="${ROSELY_VOICE_VRAM_MODE:-auto}"
+export REQUIRE_VOICE_FOR_HEALTH="${REQUIRE_VOICE_FOR_HEALTH:-false}"
+export VOICE_DOWNLOAD_WAIT_TIMEOUT_SECONDS="${VOICE_DOWNLOAD_WAIT_TIMEOUT_SECONDS:-900}"
+export VOICE_CTL_SCRIPT="${VOICE_CTL_SCRIPT:-/opt/rosely-h3-zit-serverless/voice_ctl.sh}"
+export VOICE_ENV_FILE="${VOICE_ENV_FILE:-/workspace/rosely-voice-avatar.env}"
+
 source /venv/main/bin/activate
 cd /workspace/vast-pyworker
 

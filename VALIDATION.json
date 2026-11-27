@@ -7,6 +7,14 @@
     "bash_n_ok": true,
     "stderr": ""
   },
+  "scripts/start_voice_sync.sh": {
+    "bash_n_ok": true,
+    "stderr": ""
+  },
+  "scripts/voice_ctl.sh": {
+    "bash_n_ok": true,
+    "stderr": ""
+  },
   "scripts/start_model_server.sh": {
     "bash_n_ok": true,
     "stderr": ""
@@ -20,6 +28,8 @@
   "h3_manifest_sha256": "45ad09171573a127d7388e6ab22ed0852069bc1046d5931bb821579175b7d529",
   "zit_manifest_key": "serverless/zimage/zenith13/zenith13-mxfp8-full-detailer-seedvr2-v3-direct/manifest.json",
   "zit_manifest_sha256": "14b308d29489719b09beeff9708e6961537319eadc02cdac4f94b68da47fd6d4",
+  "voice_manifest_key": "models/voice-avatar/rosely-voice-ditto-v1/manifest.json",
+  "voice_manifest_sha256": "334a6170d549cae722100b49cfdd716e0d59882d90fd6d68c9e59e22704e4421",
   "base_image": "vastai/pytorch:cuda-13.0.3-auto",
   "disk_gb": 150
 }

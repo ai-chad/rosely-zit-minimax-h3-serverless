@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import subprocess
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -17,7 +18,7 @@ from typing import Any, Literal
 
 import boto3
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,11 +47,35 @@ H3_READY_MARKER = STATE_DIR / "h3.ready"
 H3_STATUS_FILE = STATE_DIR / "h3-download-status.json"
 ZIT_READY_MARKER = STATE_DIR / "zit.ready"
 ZIT_STATUS_FILE = STATE_DIR / "zit-download-status.json"
+VOICE_READY_MARKER = STATE_DIR / "voice.ready"
+VOICE_STATUS_FILE = STATE_DIR / "voice-download-status.json"
 
 VIDEO_GENERATION_TIMEOUT = int(os.getenv("GENERATION_TIMEOUT_SECONDS", "3600"))
 IMAGE_GENERATION_TIMEOUT = int(os.getenv("IMAGE_GENERATION_TIMEOUT_SECONDS", "900"))
 H3_DOWNLOAD_WAIT_TIMEOUT = float(os.getenv("H3_DOWNLOAD_WAIT_TIMEOUT_SECONDS", "900"))
+VOICE_DOWNLOAD_WAIT_TIMEOUT = float(os.getenv("VOICE_DOWNLOAD_WAIT_TIMEOUT_SECONDS", "900"))
 REQUIRE_H3_FOR_HEALTH = os.getenv("REQUIRE_H3_FOR_HEALTH", "false").lower() == "true"
+REQUIRE_VOICE_FOR_HEALTH = os.getenv("REQUIRE_VOICE_FOR_HEALTH", "false").lower() == "true"
+VOICE_ENABLED = os.getenv("ROSELY_ENABLE_VOICE", "true").lower() == "true"
+VOICE_VRAM_MODE_RAW = os.getenv("ROSELY_VOICE_VRAM_MODE", "auto").strip().lower()
+VOICE_ENV_FILE = Path(os.getenv("VOICE_ENV_FILE", "/workspace/rosely-voice-avatar.env"))
+VOICE_CTL_SCRIPT = Path(os.getenv("VOICE_CTL_SCRIPT", "/opt/rosely-h3-zit-serverless/voice_ctl.sh"))
+VOICE_GATEWAY_URL = f"http://127.0.0.1:{os.getenv('GATEWAY_PORT', '8000')}"
+VOICE_LIVE_URL = f"http://127.0.0.1:{os.getenv('LIVE_PORT', '8006')}"
+VOICE_ROUTES = [
+    "/v1/tts",
+    "/v1/stt",
+    "/v1/avatar/generate",
+    "/v1/ditto/warm",
+    "/v1/live/join",
+]
+VOICE_ROUTE_TIMEOUTS: dict[str, float] = {
+    "/v1/tts": 180.0,
+    "/v1/stt": 180.0,
+    "/v1/avatar/generate": 960.0,
+    "/v1/ditto/warm": 300.0,
+    "/v1/live/join": 60.0,
+}
 KEEP_LOCAL_OUTPUTS = os.getenv("KEEP_LOCAL_OUTPUTS", "false").lower() == "true"
 MAX_INPUT_IMAGE_BYTES = int(
     os.getenv("MAX_INPUT_IMAGE_BYTES", str(30 * 1024 * 1024))
@@ -176,10 +201,13 @@ class ComfyHealthState:
 
 comfy_health = ComfyHealthState()
 generation_lock = asyncio.Lock()
-active_family: Literal["h3", "zit"] | None = None
-current_job_family: Literal["h3", "zit"] | None = None
+active_family: Literal["h3", "zit", "voice"] | None = None
+current_job_family: Literal["h3", "zit", "voice"] | None = None
 family_switch_count = 0
 h3_waiting_requests = 0
+voice_waiting_requests = 0
+_cached_gpu_vram_gib: float | None = None
+_gpu_vram_probed = False
 
 
 async def comfy_health_monitor() -> None:
@@ -217,8 +245,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Rosely MiniMax H3 + Zenith/Z-Image RTX 5090 Server",
-    version="2.0.0",
+    title="Rosely Unified GPU Server (ZiT + MiniMax H3 + Voice Avatar)",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -372,6 +400,207 @@ async def _wait_for_h3_ready(request_id: str) -> None:
     )
 
 
+def _detect_gpu_vram_gib() -> float | None:
+    global _cached_gpu_vram_gib, _gpu_vram_probed
+    if _gpu_vram_probed:
+        return _cached_gpu_vram_gib
+    _gpu_vram_probed = True
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=5,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        first = out.splitlines()[0].strip() if out else ""
+        if first:
+            _cached_gpu_vram_gib = float(first) / 1024.0
+    except Exception:
+        _cached_gpu_vram_gib = None
+    return _cached_gpu_vram_gib
+
+
+def _resolve_voice_vram_mode() -> Literal["switch", "resident"]:
+    if VOICE_VRAM_MODE_RAW in {"switch", "on_demand"}:
+        return "switch"
+    if VOICE_VRAM_MODE_RAW == "resident":
+        return "resident"
+    vram_gib = _detect_gpu_vram_gib()
+    if vram_gib is not None and vram_gib >= 30.0:
+        return "resident"
+    return "switch"
+
+
+def _read_voice_gateway_key() -> str:
+    env_key = os.getenv("GATEWAY_API_KEY", "").strip()
+    if env_key:
+        return env_key
+    if VOICE_ENV_FILE.is_file():
+        for raw_line in VOICE_ENV_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if line.startswith("GATEWAY_API_KEY="):
+                val = line.split("=", 1)[1].strip().strip("\"'")
+                if val:
+                    return val
+    return ""
+
+
+def _voice_availability() -> tuple[
+    Literal["disabled", "available", "downloading", "installing", "failed", "missing"],
+    dict[str, Any] | None,
+]:
+    if not VOICE_ENABLED:
+        return "disabled", None
+    dl_info = _read_download_status(VOICE_STATUS_FILE)
+    dl_status = str(dl_info.get("status") or "").lower() if dl_info else ""
+    if VOICE_READY_MARKER.is_file() and dl_status not in {"downloading", "installing", "failed"}:
+        return "available", dl_info
+    if dl_status == "failed":
+        return "failed", dl_info
+    if dl_status in {"downloading", "installing"}:
+        return dl_status, dl_info  # type: ignore[return-value]
+    if dl_status == "ready":
+        # Models synced, venv provisioning/env setup still finishing before voice.ready is written.
+        return "installing", dl_info
+    return "missing", dl_info
+
+
+async def _wait_for_voice_ready(route_label: str) -> None:
+    global voice_waiting_requests
+    state, dl_info = _voice_availability()
+    if state == "available":
+        return
+    if state == "disabled":
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "disabled", "reason": "voice_avatar_disabled"},
+        )
+    if state == "failed":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "error",
+                "reason": "voice_setup_failed",
+                "error": dl_info.get("error") if dl_info else None,
+            },
+        )
+    if state == "missing":
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "unhealthy", "reason": "voice_models_missing"},
+        )
+
+    deadline = time.monotonic() + max(1.0, VOICE_DOWNLOAD_WAIT_TIMEOUT)
+    last_log = 0.0
+    voice_waiting_requests += 1
+    logger.info(
+        "route=%s waiting for background Voice Avatar setup (state=%s timeout=%.0fs)",
+        route_label,
+        state,
+        VOICE_DOWNLOAD_WAIT_TIMEOUT,
+    )
+    try:
+        while time.monotonic() < deadline:
+            state, dl_info = _voice_availability()
+            if state == "available":
+                logger.info("route=%s Voice Avatar ready; proceeding", route_label)
+                return
+            if state == "failed":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "status": "error",
+                        "reason": "voice_setup_failed",
+                        "error": dl_info.get("error") if dl_info else None,
+                    },
+                )
+            now = time.monotonic()
+            if now - last_log >= 15.0:
+                pct = dl_info.get("percent") if dl_info else None
+                logger.info(
+                    "route=%s still waiting for Voice Avatar setup (state=%s percent=%s)",
+                    route_label,
+                    state,
+                    pct,
+                )
+                last_log = now
+            await asyncio.sleep(1.0)
+    finally:
+        voice_waiting_requests = max(0, voice_waiting_requests - 1)
+
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "status": "starting",
+            "reason": "voice_still_provisioning",
+            "retryable": True,
+            "voice_download": dl_info,
+        },
+    )
+
+
+async def _voice_gateway_healthy() -> bool:
+    timeout = httpx.Timeout(connect=1.0, read=2.0, write=1.0, pool=1.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{VOICE_GATEWAY_URL}/health")
+            if resp.status_code == 200:
+                return bool(resp.json().get("ok"))
+    except Exception:
+        pass
+    return False
+
+
+async def _is_live_call_active() -> bool:
+    timeout = httpx.Timeout(connect=1.0, read=1.5, write=1.0, pool=1.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{VOICE_LIVE_URL}/health")
+            if resp.status_code == 200:
+                return bool(resp.json().get("busy"))
+    except Exception:
+        pass
+    return False
+
+
+async def _run_voice_ctl(action: Literal["start", "stop"], timeout_s: float) -> None:
+    if not VOICE_CTL_SCRIPT.is_file():
+        raise HTTPException(
+            status_code=503,
+            detail=f"Voice controller script missing: {VOICE_CTL_SCRIPT}",
+        )
+    started = time.monotonic()
+    logger.info("voice_ctl action=%s starting", action)
+    proc = await asyncio.create_subprocess_exec(
+        "/bin/bash",
+        str(VOICE_CTL_SCRIPT),
+        action,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        raise HTTPException(
+            status_code=503,
+            detail=f"voice_ctl {action} timed out after {timeout_s:.0f}s",
+        ) from None
+    out_text = (out_bytes or b"").decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        logger.error("voice_ctl action=%s failed rc=%s output=%s", action, proc.returncode, out_text[-1500:])
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "error",
+                "reason": f"voice_ctl_{action}_failed",
+                "output": out_text[-1000:],
+            },
+        )
+    logger.info("voice_ctl action=%s completed in %.2fs", action, time.monotonic() - started)
+
+
 def _load_h3_workflow() -> dict[str, Any]:
     if not H3_WORKFLOW_PATH.is_file():
         raise RuntimeError(f"H3 workflow not found: {H3_WORKFLOW_PATH}")
@@ -433,38 +662,63 @@ async def _recover_after_generation_failure(reason: str) -> None:
     active_family = None
 
 
-async def _prepare_family(family: Literal["h3", "zit"]) -> None:
+async def _free_comfy_memory(reason: str) -> None:
+    timeout = httpx.Timeout(15.0, connect=3.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                f"{COMFY_URL}/free",
+                json={"unload_models": True, "free_memory": True},
+            )
+            response.raise_for_status()
+            await asyncio.sleep(max(0.0, FAMILY_SWITCH_SETTLE_SECONDS))
+            with contextlib.suppress(Exception):
+                stats = await client.get(f"{COMFY_URL}/system_stats")
+                if stats.status_code == 200:
+                    comfy_health.mark_success()
+    except Exception as exc:
+        logger.warning(
+            "%s ComfyUI memory cleanup failed; continuing. error=%s",
+            reason,
+            exc,
+        )
+
+
+async def _prepare_family(family: Literal["h3", "zit", "voice"]) -> None:
     global active_family, family_switch_count
 
-    if active_family == family:
-        return
-
     old_family = active_family
-    if FREE_ON_FAMILY_SWITCH and old_family is not None:
-        timeout = httpx.Timeout(15.0, connect=3.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    f"{COMFY_URL}/free",
-                    json={"unload_models": True, "free_memory": True},
-                )
-                response.raise_for_status()
-                # /free sets flags consumed by ComfyUI's queue worker. We hold the
-                # only generation lock, so it is idle here; a short settle avoids
-                # racing the next prompt against the unload tick.
-                await asyncio.sleep(max(0.0, FAMILY_SWITCH_SETTLE_SECONDS))
-                with contextlib.suppress(Exception):
-                    stats = await client.get(f"{COMFY_URL}/system_stats")
-                    if stats.status_code == 200:
-                        comfy_health.mark_success()
-        except Exception as exc:
-            logger.warning(
-                "family_switch=%s->%s memory cleanup failed; continuing with "
-                "ComfyUI smart memory management. error=%s",
-                old_family,
-                family,
-                exc,
+
+    if family in {"h3", "zit"}:
+        if VOICE_ENABLED and await _is_live_call_active():
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "busy",
+                    "reason": "live_call_in_progress",
+                    "retryable": True,
+                },
             )
+        if VOICE_ENABLED and _resolve_voice_vram_mode() == "switch":
+            if old_family == "voice" or await _voice_gateway_healthy():
+                await _run_voice_ctl("stop", timeout_s=45.0)
+        if old_family == family:
+            return
+        if FREE_ON_FAMILY_SWITCH and old_family in {"h3", "zit"}:
+            await _free_comfy_memory(f"family_switch={old_family}->{family}")
+    else:
+        # Switching to Voice Avatar (ASR + TTS + Ditto + Live)
+        if FREE_ON_FAMILY_SWITCH and old_family != "voice":
+            await _free_comfy_memory(f"family_switch={old_family}->voice")
+        if not await _voice_gateway_healthy():
+            await _run_voice_ctl("start", timeout_s=240.0)
+            if not await _voice_gateway_healthy():
+                raise HTTPException(
+                    status_code=503,
+                    detail={"status": "error", "reason": "voice_gateway_unhealthy_after_start"},
+                )
+        if old_family == "voice":
+            return
 
     active_family = family
     if old_family is not None and old_family != family:
@@ -1174,6 +1428,7 @@ def _infer_task_type(data: dict[str, Any]) -> Literal["image", "video"]:
 async def health() -> dict[str, Any]:
     zit_state, missing_zit, _ = _zit_availability()
     h3_state, missing_h3, h3_dl = _h3_availability()
+    voice_state, voice_dl = _voice_availability()
 
     h3_bucket_ok = bool(
         os.getenv("ROSELY_H3_OUTPUT_BUCKET") or os.getenv("ROSELY_H3_S3_BUCKET")
@@ -1186,15 +1441,17 @@ async def health() -> dict[str, Any]:
     )
 
     h3_blocks_health = REQUIRE_H3_FOR_HEALTH and h3_state != "available"
-    if zit_state != "available" or h3_blocks_health or not h3_bucket_ok or not zit_bucket_ok:
+    voice_blocks_health = REQUIRE_VOICE_FOR_HEALTH and VOICE_ENABLED and voice_state != "available"
+    if zit_state != "available" or h3_blocks_health or voice_blocks_health or not h3_bucket_ok or not zit_bucket_ok:
         raise HTTPException(
             status_code=503,
             detail={
                 "status": "unhealthy",
                 "reason": "local prerequisites missing",
                 "missing_models": missing_zit + (missing_h3 if h3_blocks_health else []),
-                "models": {"h3": h3_state, "zit": zit_state},
+                "models": {"h3": h3_state, "zit": zit_state, "voice": voice_state},
                 "h3_download": h3_dl,
+                "voice_download": voice_dl,
                 "h3_s3_output_configured": h3_bucket_ok,
                 "zit_s3_output_configured": zit_bucket_ok,
             },
@@ -1225,18 +1482,24 @@ async def health() -> dict[str, Any]:
             },
         )
 
+    routes = ["/generate/sync", "/generate/video", "/generate/image"]
+    if VOICE_ENABLED:
+        routes.extend(VOICE_ROUTES)
+
     return {
         "status": "ok",
-        "profile": "rosely-h3-zit-5090",
+        "profile": "rosely-unified-zit-h3-voice",
         "comfyui": "alive",
         "active_family": active_family,
         "current_job_family": current_job_family,
         "gpu_busy": generation_lock.locked(),
         "family_switch_count": family_switch_count,
         "h3_model": H3_BASE_MODEL,
-        "models": {"h3": h3_state, "zit": zit_state},
+        "voice_vram_mode": _resolve_voice_vram_mode(),
+        "models": {"h3": h3_state, "zit": zit_state, "voice": voice_state},
         "h3_download": h3_dl,
-        "routes": ["/generate/sync", "/generate/video", "/generate/image"],
+        "voice_download": voice_dl,
+        "routes": routes,
         "last_comfy_success_seconds_ago": round(age, 2),
         "last_probe_error": comfy_health.last_error,
     }
@@ -1246,15 +1509,18 @@ async def health() -> dict[str, Any]:
 async def ready() -> dict[str, Any]:
     zit_state, missing_zit, _ = _zit_availability()
     h3_state, missing_h3, h3_dl = _h3_availability()
+    voice_state, voice_dl = _voice_availability()
     h3_blocks = REQUIRE_H3_FOR_HEALTH and h3_state != "available"
-    if zit_state != "available" or h3_blocks:
+    voice_blocks = REQUIRE_VOICE_FOR_HEALTH and VOICE_ENABLED and voice_state != "available"
+    if zit_state != "available" or h3_blocks or voice_blocks:
         raise HTTPException(
             status_code=503,
             detail={
                 "status": "not_ready",
                 "missing_models": missing_zit + (missing_h3 if h3_blocks else []),
-                "models": {"h3": h3_state, "zit": zit_state},
+                "models": {"h3": h3_state, "zit": zit_state, "voice": voice_state},
                 "h3_download": h3_dl,
+                "voice_download": voice_dl,
             },
         )
     timeout = httpx.Timeout(connect=1.0, read=5.0, write=1.0, pool=1.0)
@@ -1269,8 +1535,10 @@ async def ready() -> dict[str, Any]:
             "active_family": active_family,
             "gpu_busy": generation_lock.locked(),
             "h3_model": H3_BASE_MODEL,
-            "models": {"h3": h3_state, "zit": zit_state},
+            "voice_vram_mode": _resolve_voice_vram_mode(),
+            "models": {"h3": h3_state, "zit": zit_state, "voice": voice_state},
             "h3_download": h3_dl,
+            "voice_download": voice_dl,
         }
     except Exception as exc:
         comfy_health.mark_failure(f"{type(exc).__name__}: {exc}")
@@ -1284,6 +1552,7 @@ async def ready() -> dict[str, Any]:
 async def status() -> dict[str, Any]:
     zit_state, missing_zit, zit_dl = _zit_availability()
     h3_state, missing_h3, h3_dl = _h3_availability()
+    voice_state, voice_dl = _voice_availability()
     return {
         "active_family": active_family,
         "current_job_family": current_job_family,
@@ -1293,12 +1562,99 @@ async def status() -> dict[str, Any]:
         "reject_image_while_video_busy": REJECT_IMAGE_WHILE_VIDEO_BUSY,
         "h3_model": H3_BASE_MODEL,
         "h3_default_sampler": H3_FORCE_SAMPLER or H3_DEFAULT_SAMPLER,
-        "models": {"h3": h3_state, "zit": zit_state},
+        "voice_enabled": VOICE_ENABLED,
+        "voice_vram_mode": _resolve_voice_vram_mode(),
+        "voice_gateway_running": await _voice_gateway_healthy() if VOICE_ENABLED else False,
+        "live_call_active": await _is_live_call_active() if VOICE_ENABLED else False,
+        "models": {"h3": h3_state, "zit": zit_state, "voice": voice_state},
         "missing_models": {"h3": missing_h3, "zit": missing_zit},
         "h3_waiting_requests": h3_waiting_requests,
+        "voice_waiting_requests": voice_waiting_requests,
         "h3_download": h3_dl,
         "zit_download": zit_dl,
+        "voice_download": voice_dl,
     }
+
+
+async def _proxy_voice(path: str, request: Request) -> dict[str, Any]:
+    global current_job_family
+    await _wait_for_voice_ready(path)
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc}") from exc
+
+    read_timeout = VOICE_ROUTE_TIMEOUTS.get(path, 180.0)
+    async with generation_lock:
+        current_job_family = "voice"
+        try:
+            await _prepare_family("voice")
+            key = _read_voice_gateway_key()
+            if not key:
+                raise HTTPException(status_code=503, detail="missing internal voice gateway key")
+            timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=120.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                try:
+                    response = await client.post(
+                        f"{VOICE_GATEWAY_URL}{path}",
+                        json=payload,
+                        headers={"X-API-Key": key},
+                    )
+                except httpx.HTTPError as exc:
+                    raise HTTPException(status_code=502, detail=f"voice gateway unreachable: {exc}") from exc
+            if response.status_code >= 400:
+                try:
+                    detail = response.json()
+                except ValueError:
+                    detail = response.text[:1000]
+                raise HTTPException(status_code=response.status_code, detail=detail)
+            return response.json()
+        finally:
+            current_job_family = None
+
+
+@app.post("/internal/voice/warm")
+async def internal_voice_warm() -> dict[str, Any]:
+    global current_job_family
+    if not VOICE_ENABLED:
+        return {"status": "disabled"}
+    state, _ = _voice_availability()
+    if state != "available":
+        return {"status": "not_ready", "voice_state": state}
+    if generation_lock.locked():
+        return {"status": "deferred", "reason": "gpu_busy"}
+    async with generation_lock:
+        current_job_family = "voice"
+        try:
+            await _prepare_family("voice")
+            return {"status": "warm", "voice_vram_mode": _resolve_voice_vram_mode()}
+        finally:
+            current_job_family = None
+
+
+@app.post("/v1/tts")
+async def voice_tts(request: Request) -> dict[str, Any]:
+    return await _proxy_voice("/v1/tts", request)
+
+
+@app.post("/v1/stt")
+async def voice_stt(request: Request) -> dict[str, Any]:
+    return await _proxy_voice("/v1/stt", request)
+
+
+@app.post("/v1/avatar/generate")
+async def voice_avatar_generate(request: Request) -> dict[str, Any]:
+    return await _proxy_voice("/v1/avatar/generate", request)
+
+
+@app.post("/v1/ditto/warm")
+async def voice_ditto_warm(request: Request) -> dict[str, Any]:
+    return await _proxy_voice("/v1/ditto/warm", request)
+
+
+@app.post("/v1/live/join")
+async def voice_live_join(request: Request) -> dict[str, Any]:
+    return await _proxy_voice("/v1/live/join", request)
 
 
 @app.post("/generate/video")

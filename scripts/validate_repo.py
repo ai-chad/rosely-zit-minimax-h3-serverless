@@ -66,11 +66,28 @@ for mode in MODE_TO_FILE:
 print("All ZiT workflows OK")
 
 server_text = (ROOT / "model_server.py").read_text()
-for route in ["/generate/sync", "/generate/video", "/generate/image", "/health", "/ready", "/status"]:
+for route in [
+    "/generate/sync",
+    "/generate/video",
+    "/generate/image",
+    "/v1/tts",
+    "/v1/stt",
+    "/v1/avatar/generate",
+    "/v1/ditto/warm",
+    "/v1/live/join",
+    "/health",
+    "/ready",
+    "/status",
+]:
     require(route in server_text, f"Missing route {route}")
 require("generation_lock = asyncio.Lock()" in server_text, "Global generation lock missing")
 require("/free" in server_text, "ComfyUI family-switch cleanup missing")
 require("_wait_for_h3_ready" in server_text, "Background H3 wait helper missing")
-print("Server invariants OK")
+require("_wait_for_voice_ready" in server_text, "Background Voice wait helper missing")
+
+worker_text = (ROOT / "worker.py").read_text()
+for route in ["/generate/sync", "/generate/video", "/generate/image", "/v1/tts", "/v1/stt", "/v1/avatar/generate", "/v1/ditto/warm", "/v1/live/join"]:
+    require(route in worker_text, f"Missing worker handler route {route}")
+print("Server + Worker invariants OK")
 
 print("VALIDATION PASSED")
