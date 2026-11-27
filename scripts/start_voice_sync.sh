@@ -173,10 +173,17 @@ log "Step 3/5: Ensuring Python 3.10 and isolated voice virtualenvs (asr, tts, di
 ENVS="${WORKSPACE}/rosely-venvs"
 mkdir -p "$ENVS"
 
+UV_VOICE_CACHE="${STATE_DIR}/uv-voice-cache"
+mkdir -p "$UV_VOICE_CACHE"
+cleanup_uv_cache() {
+  rm -rf "$UV_VOICE_CACHE" || true
+}
+trap cleanup_uv_cache EXIT
+
 uv_install() {
   local py="$1"
   shift
-  if "$UV_BIN" pip install --python "$py" --no-cache --no-progress --index-strategy unsafe-best-match "$@"; then
+  if UV_CACHE_DIR="$UV_VOICE_CACHE" "$UV_BIN" pip install --python "$py" --no-progress --index-strategy unsafe-best-match "$@"; then
     return 0
   fi
   log "uv pip install fallback to pip for ${py}"
