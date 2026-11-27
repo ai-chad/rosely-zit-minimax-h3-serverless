@@ -457,6 +457,32 @@ class StagedReadinessTests(unittest.TestCase):
             except ProcessLookupError:
                 pass
 
+    def test_voice_request_rejects_fast_with_503_while_h3_video_is_busy(self) -> None:
+        (self.state_dir / "voice.ready").write_text("ok", encoding="utf-8")
+
+        class FakeRequest:
+            async def json(self):
+                return {"input": "hello", "voice": "en_female_original"}
+
+        async def run() -> None:
+            async with model_server.generation_lock:
+                model_server.current_job_family = "h3"
+                try:
+                    with self.assertRaises(model_server.HTTPException) as ctx:
+                        await model_server._proxy_voice("/v1/tts", FakeRequest())
+                finally:
+                    model_server.current_job_family = None
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertEqual(ctx.exception.detail["status"], "busy")
+            self.assertEqual(ctx.exception.detail["reason"], "video_generation_in_progress")
+            self.assertTrue(ctx.exception.detail["retryable"])
+
+        with (
+            mock.patch.object(model_server, "VOICE_ENABLED", True),
+            mock.patch.object(model_server, "REJECT_VOICE_WHILE_VIDEO_BUSY", True),
+        ):
+            asyncio.run(run())
+
 
 if __name__ == "__main__":
     unittest.main()

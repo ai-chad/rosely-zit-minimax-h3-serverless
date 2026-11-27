@@ -176,6 +176,9 @@ COMFY_BUSY_HEALTH_STALE_SECONDS = float(
 REJECT_IMAGE_WHILE_VIDEO_BUSY = (
     os.getenv("REJECT_IMAGE_WHILE_VIDEO_BUSY", "true").lower() == "true"
 )
+REJECT_VOICE_WHILE_VIDEO_BUSY = (
+    os.getenv("REJECT_VOICE_WHILE_VIDEO_BUSY", "true").lower() == "true"
+)
 
 
 class ComfyHealthState:
@@ -1573,6 +1576,7 @@ async def status() -> dict[str, Any]:
         "family_switch_count": family_switch_count,
         "free_on_family_switch": FREE_ON_FAMILY_SWITCH,
         "reject_image_while_video_busy": REJECT_IMAGE_WHILE_VIDEO_BUSY,
+        "reject_voice_while_video_busy": REJECT_VOICE_WHILE_VIDEO_BUSY,
         "h3_model": H3_BASE_MODEL,
         "h3_default_sampler": H3_FORCE_SAMPLER or H3_DEFAULT_SAMPLER,
         "voice_enabled": VOICE_ENABLED,
@@ -1596,6 +1600,16 @@ async def _proxy_voice(path: str, request: Request) -> dict[str, Any]:
         payload = await request.json()
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid JSON payload: {exc}") from exc
+
+    if REJECT_VOICE_WHILE_VIDEO_BUSY and generation_lock.locked() and current_job_family == "h3":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "busy",
+                "reason": "video_generation_in_progress",
+                "retryable": True,
+            },
+        )
 
     read_timeout = VOICE_ROUTE_TIMEOUTS.get(path, 180.0)
     async with generation_lock:
