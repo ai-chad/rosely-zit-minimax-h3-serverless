@@ -63,6 +63,7 @@ PYWORKER_REF="${PYWORKER_REF:-main}"
 
 MODEL_BUNDLE_MODE="${MODEL_BUNDLE_MODE:-direct}"
 MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-85}"
+MIN_CUDA_CAPABILITY="${MIN_CUDA_CAPABILITY:-8.9}"
 INSTALL_ZIT_OPTIONAL_NODES="${ROSELY_INSTALL_ZIT_OPTIONAL_NODES:-true}"
 INSTALL_SAM2="${ROSELY_INSTALL_SAM2:-false}"
 WAIT_FOR_H3_DURING_PROVISION="${ROSELY_WAIT_FOR_H3_DURING_PROVISION:-false}"
@@ -272,9 +273,16 @@ install_comfy_and_optional_zit_nodes() {
       python "$COMFY_DIR/custom_nodes/ComfyUI-Impact-Pack/install.py"
 
     if ! python -c 'import torchaudio' >/dev/null 2>&1; then
-      local torch_ver
+      local torch_ver cuda_tag
       torch_ver=$(python -c 'import torch; print(torch.__version__.split("+")[0])')
-      python -m pip install --no-deps "torchaudio==${torch_ver}"
+      cuda_tag=$(python -c 'import torch; v=torch.__version__; print(v.split("+")[1] if "+" in v else "")')
+      if [[ -n "$cuda_tag" ]]; then
+        fast_pip_install --no-deps --extra-index-url "https://download.pytorch.org/whl/${cuda_tag}" "torchaudio==${torch_ver}+${cuda_tag}" \
+          || fast_pip_install --no-deps --extra-index-url "https://download.pytorch.org/whl/${cuda_tag}" torchaudio \
+          || fast_pip_install --no-deps torchaudio
+      else
+        fast_pip_install --no-deps "torchaudio==${torch_ver}" || fast_pip_install --no-deps torchaudio
+      fi
     fi
   fi
 }
@@ -352,14 +360,21 @@ ensure_system_packages
 [[ -f /venv/main/bin/activate ]] || fail "/venv/main missing; use a recent Vast PyTorch CUDA image with RTX 5090/Blackwell support"
 source /venv/main/bin/activate
 
-log "Checking CUDA / Blackwell"
-python - <<'PY'
-import torch
-print('Torch:',torch.__version__,'CUDA:',torch.version.cuda,'available:',torch.cuda.is_available())
-if not torch.cuda.is_available(): raise SystemExit('CUDA unavailable')
-name=torch.cuda.get_device_name(0); cap=torch.cuda.get_device_capability(0)
-print('GPU:',name,'compute capability:',cap)
-if cap[0] < 12: raise SystemExit(f'Blackwell GPU required; detected {name} capability {cap}')
+log "Checking CUDA / GPU capability (min=${MIN_CUDA_CAPABILITY})"
+MIN_CUDA_CAPABILITY="$MIN_CUDA_CAPABILITY" python - <<'PY'
+import os, torch
+print('Torch:', torch.__version__, 'CUDA:', torch.version.cuda, 'available:', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    raise SystemExit('CUDA unavailable')
+name = torch.cuda.get_device_name(0)
+cap = torch.cuda.get_device_capability(0)
+vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+print(f'GPU: {name} compute capability: {cap} VRAM: {vram_gb:.1f} GiB')
+min_req = tuple(int(x) for x in os.environ.get('MIN_CUDA_CAPABILITY', '8.9').split('.'))
+if cap < min_req:
+    raise SystemExit(f'GPU compute capability >= {min_req} required; detected {name} capability {cap}')
+if cap[0] < 12:
+    print(f'NOTE: Non-Blackwell GPU ({name}, CC {cap}, {vram_gb:.1f} GiB VRAM); MXFP8/NVFP4 will use comfy-kitchen fallback paths.')
 PY
 
 log "Cloning combined deployment repository"
