@@ -93,21 +93,32 @@ wait_health() {
 
 launch_api() {
   local name="$1" envname="$2" module="$3" bind="$4" port="$5" extra_ld="${6:-}"
+  local pybin="${WORKSPACE}/rosely-venvs/${envname}/bin/python"
   local uvicorn="${WORKSPACE}/rosely-venvs/${envname}/bin/uvicorn"
   [[ -x "$uvicorn" ]] || { log "ERROR: missing $uvicorn" >&2; return 1; }
   log "Starting $name on $bind:$port"
-  if [[ -n "$extra_ld" ]]; then
-    (
-      export LD_LIBRARY_PATH="${extra_ld}:${LD_LIBRARY_PATH:-}"
-      nohup "$uvicorn" "${module}:app" --host "$bind" --port "$port" --workers 1 \
-        >"$LOGS/$name.log" 2>&1 &
-      echo "$!" >"$RUN/$name.pid"
+  # Spawn detached daemon with close_fds=True so background uvicorn workers NEVER
+  # inherit our flock descriptor (fd 9) or caller stdout/stderr pipes.
+  "$pybin" - "$uvicorn" "${module}:app" "$bind" "$port" "$LOGS/$name.log" "$RUN/$name.pid" "$extra_ld" <<'PY'
+import os, subprocess, sys
+uvicorn_bin, app_ref, bind, port, log_path, pid_path, extra_ld = sys.argv[1:]
+env = os.environ.copy()
+if extra_ld:
+    prev = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{extra_ld}:{prev}" if prev else extra_ld
+with open(log_path, "wb") as log_fh:
+    proc = subprocess.Popen(
+        [uvicorn_bin, app_ref, "--host", bind, "--port", port, "--workers", "1"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        close_fds=True,
+        start_new_session=True,
+        env=env,
     )
-  else
-    nohup "$uvicorn" "${module}:app" --host "$bind" --port "$port" --workers 1 \
-      >"$LOGS/$name.log" 2>&1 &
-    echo "$!" >"$RUN/$name.pid"
-  fi
+with open(pid_path, "w", encoding="utf-8") as pid_fh:
+    pid_fh.write(f"{proc.pid}\n")
+PY
 }
 
 start_all() {
@@ -124,7 +135,7 @@ start_all() {
   cd "$VOICE_APP_DIR"
 
   # Launch ASR, TTS, Ditto, and optional Live agent in parallel to minimize
-  # switch-in latency (~10-15s instead of ~35-45s serial).
+  # switch-in latency (~10-20s instead of ~45-60s serial).
   launch_api asr asr asr_server 127.0.0.1 "$ASR_PORT"
   launch_api tts tts tts_server 127.0.0.1 "$TTS_PORT"
   launch_api ditto ditto ditto_server 127.0.0.1 "$DITTO_PORT" "$DITTO_CUDNN8_DIR"
@@ -165,7 +176,7 @@ status_all() {
 }
 
 exec 9>"$STATE_DIR/voice-ctl.lock"
-flock 9
+flock -w 30 9 || { log "ERROR: Timed out acquiring $STATE_DIR/voice-ctl.lock" >&2; exit 1; }
 
 case "$CMD" in
   start)   start_all ;;

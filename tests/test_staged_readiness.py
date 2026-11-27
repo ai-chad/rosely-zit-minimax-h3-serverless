@@ -423,6 +423,40 @@ class StagedReadinessTests(unittest.TestCase):
         self.assertTrue(custom_marker.is_file())
         self.assertFalse((state_dir / "voice.ready").exists())
 
+    def test_voice_ctl_detached_daemon_does_not_leak_flock_or_hang_stop(self) -> None:
+        # Regression test: spawning detached uvicorn daemons inside voice_ctl.sh
+        # must close fd 9 (voice-ctl.lock) so a subsequent stop never deadlocks.
+        script_text = (Path(__file__).resolve().parent.parent / "scripts" / "voice_ctl.sh").read_text(encoding="utf-8")
+        self.assertIn("close_fds=True", script_text)
+        self.assertIn("start_new_session=True", script_text)
+        self.assertIn("flock -w 30 9", script_text)
+
+        import subprocess
+
+        lock_file = self.state_dir / "test-voice-ctl.lock"
+        pid_file = self.state_dir / "daemon.pid"
+        py_exe = os.sys.executable
+        start_cmd = (
+            f'exec 9>"{lock_file}"; flock -w 5 9; '
+            f'"{py_exe}" -c "import subprocess, sys; '
+            f'p = subprocess.Popen([sys.executable, \'-c\', \'import time; time.sleep(30)\'], '
+            f'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, '
+            f'close_fds=True, start_new_session=True); '
+            f'open({str(pid_file)!r}, \'w\').write(str(p.pid))"'
+        )
+        subprocess.run(["/bin/bash", "-c", start_cmd], check=True, timeout=5)
+        daemon_pid = int(pid_file.read_text().strip())
+        try:
+            # Must acquire lock immediately while daemon is still alive!
+            stop_cmd = f'exec 9>"{lock_file}"; flock -w 2 9 && echo LOCK_ACQUIRED'
+            res = subprocess.run(["/bin/bash", "-c", stop_cmd], capture_output=True, text=True, check=True, timeout=5)
+            self.assertIn("LOCK_ACQUIRED", res.stdout)
+        finally:
+            try:
+                os.kill(daemon_pid, 9)
+            except ProcessLookupError:
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()

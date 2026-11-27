@@ -571,25 +571,38 @@ async def _run_voice_ctl(action: Literal["start", "stop"], timeout_s: float) -> 
         )
     started = time.monotonic()
     logger.info("voice_ctl action=%s starting", action)
-    proc = await asyncio.create_subprocess_exec(
-        "/bin/bash",
-        str(VOICE_CTL_SCRIPT),
-        action,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    try:
-        out_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        raise HTTPException(
-            status_code=503,
-            detail=f"voice_ctl {action} timed out after {timeout_s:.0f}s",
-        ) from None
-    out_text = (out_bytes or b"").decode("utf-8", errors="replace").strip()
-    if proc.returncode != 0:
-        logger.error("voice_ctl action=%s failed rc=%s output=%s", action, proc.returncode, out_text[-1500:])
+    log_path = STATE_DIR / f"voice-ctl-{action}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("wb") as log_fh:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            str(VOICE_CTL_SCRIPT),
+            action,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            out_tail = log_path.read_text(encoding="utf-8", errors="replace")[-1000:]
+            logger.error("voice_ctl action=%s timed out after %.0fs tail=%s", action, timeout_s, out_tail)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "error",
+                    "reason": f"voice_ctl_{action}_timeout",
+                    "timeout_seconds": timeout_s,
+                    "output": out_tail,
+                },
+            ) from None
+    out_text = log_path.read_text(encoding="utf-8", errors="replace").strip()
+    if rc != 0:
+        logger.error("voice_ctl action=%s failed rc=%s output=%s", action, rc, out_text[-1500:])
         raise HTTPException(
             status_code=503,
             detail={
