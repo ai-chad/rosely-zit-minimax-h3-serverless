@@ -483,6 +483,56 @@ class StagedReadinessTests(unittest.TestCase):
         ):
             asyncio.run(run())
 
+    def test_ditto_warm_does_not_block_concurrent_stt_or_tts(self) -> None:
+        (self.state_dir / "voice.ready").write_text("ok", encoding="utf-8")
+        model_server.VOICE_ENV_FILE.write_text("GATEWAY_API_KEY=secret_test\n", encoding="utf-8")
+        warm_entered = asyncio.Event()
+        release_warm = asyncio.Event()
+
+        class FakeResp:
+            def __init__(self, data):
+                self.status_code = 200
+                self._data = data
+
+            def json(self):
+                return self._data
+
+        class FakeClient:
+            is_closed = False
+
+            async def post(self, url, json=None, headers=None, timeout=None):
+                if url.endswith("/v1/ditto/warm"):
+                    warm_entered.set()
+                    await release_warm.wait()
+                    return FakeResp({"ok": True, "clips": {}})
+                return FakeResp({"text": "hello"})
+
+        class FakeReq:
+            def __init__(self, body):
+                self._body = body
+
+            async def json(self):
+                return self._body
+
+        async def run() -> None:
+            model_server.active_family = "voice"
+            model_server._voice_last_healthy_at = 1e12
+            with mock.patch.object(model_server, "_get_voice_gateway_client", return_value=FakeClient()):
+                warm_task = asyncio.create_task(model_server._proxy_voice("/v1/ditto/warm", FakeReq({"clips": []})))
+                await asyncio.wait_for(warm_entered.wait(), timeout=2)
+                # /v1/stt must complete immediately while /v1/ditto/warm is still running!
+                stt_res = await asyncio.wait_for(
+                    model_server._proxy_voice("/v1/stt", FakeReq({"audio_base64": "YQ=="})),
+                    timeout=2,
+                )
+                self.assertEqual(stt_res, {"text": "hello"})
+                release_warm.set()
+                warm_res = await asyncio.wait_for(warm_task, timeout=2)
+                self.assertEqual(warm_res, {"ok": True, "clips": {}})
+
+        asyncio.run(run())
+        self.assertEqual(model_server._voice_inflight, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

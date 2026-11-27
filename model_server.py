@@ -209,8 +209,26 @@ current_job_family: Literal["h3", "zit", "voice"] | None = None
 family_switch_count = 0
 h3_waiting_requests = 0
 voice_waiting_requests = 0
+_voice_inflight = 0
+_voice_last_healthy_at = 0.0
+_voice_gateway_client: httpx.AsyncClient | None = None
+_voice_gateway_client_loop: asyncio.AbstractEventLoop | None = None
+VOICE_HEALTH_CACHE_SECONDS = float(os.getenv("VOICE_HEALTH_CACHE_SECONDS", "3.0"))
 _cached_gpu_vram_gib: float | None = None
 _gpu_vram_probed = False
+
+
+def _get_voice_gateway_client() -> httpx.AsyncClient:
+    """Persistent keep-alive client to loopback voice_gateway (scoped to active loop)."""
+    global _voice_gateway_client, _voice_gateway_client_loop
+    loop = asyncio.get_running_loop()
+    if _voice_gateway_client is None or _voice_gateway_client.is_closed or _voice_gateway_client_loop is not loop:
+        _voice_gateway_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=960.0, write=120.0, pool=10.0),
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+        )
+        _voice_gateway_client_loop = loop
+    return _voice_gateway_client
 
 
 async def comfy_health_monitor() -> None:
@@ -701,11 +719,15 @@ async def _free_comfy_memory(reason: str) -> None:
 
 
 async def _prepare_family(family: Literal["h3", "zit", "voice"]) -> None:
-    global active_family, family_switch_count
+    global active_family, family_switch_count, _voice_last_healthy_at
 
     old_family = active_family
 
     if family in {"h3", "zit"}:
+        # Wait for any concurrent in-flight voice requests (e.g. /v1/tts, /v1/avatar/generate,
+        # /v1/ditto/warm) before stopping voice services or switching to ComfyUI.
+        while _voice_inflight > 0:
+            await asyncio.sleep(0.05)
         if VOICE_ENABLED and await _is_live_call_active():
             raise HTTPException(
                 status_code=503,
@@ -718,12 +740,15 @@ async def _prepare_family(family: Literal["h3", "zit", "voice"]) -> None:
         if VOICE_ENABLED and _resolve_voice_vram_mode() == "switch":
             if old_family == "voice" or await _voice_gateway_healthy():
                 await _run_voice_ctl("stop", timeout_s=45.0)
+                _voice_last_healthy_at = 0.0
         if old_family == family:
             return
         if FREE_ON_FAMILY_SWITCH and old_family in {"h3", "zit"}:
             await _free_comfy_memory(f"family_switch={old_family}->{family}")
     else:
         # Switching to Voice Avatar (ASR + TTS + Ditto + Live)
+        if old_family == "voice" and (time.monotonic() - _voice_last_healthy_at) < VOICE_HEALTH_CACHE_SECONDS:
+            return
         if FREE_ON_FAMILY_SWITCH and old_family != "voice":
             await _free_comfy_memory(f"family_switch={old_family}->voice")
         if not await _voice_gateway_healthy():
@@ -733,6 +758,7 @@ async def _prepare_family(family: Literal["h3", "zit", "voice"]) -> None:
                     status_code=503,
                     detail={"status": "error", "reason": "voice_gateway_unhealthy_after_start"},
                 )
+        _voice_last_healthy_at = time.monotonic()
         if old_family == "voice":
             return
 
@@ -1594,7 +1620,7 @@ async def status() -> dict[str, Any]:
 
 
 async def _proxy_voice(path: str, request: Request) -> dict[str, Any]:
-    global current_job_family
+    global current_job_family, _voice_inflight, _voice_last_healthy_at
     await _wait_for_voice_ready(path)
     try:
         payload = await request.json()
@@ -1611,7 +1637,16 @@ async def _proxy_voice(path: str, request: Request) -> dict[str, Any]:
             },
         )
 
+    # Best-effort clip warm-up must never block behind active ComfyUI image/video jobs
+    # or hold generation_lock across a 10-40s registration while STT/TTS arrive.
+    if path == "/v1/ditto/warm" and generation_lock.locked() and active_family != "voice":
+        return {"ok": True, "skipped": "gpu_busy"}
+
     read_timeout = VOICE_ROUTE_TIMEOUTS.get(path, 180.0)
+    # Acquire generation_lock ONLY to ensure the voice family is active and register
+    # an in-flight voice request. Release it before calling voice_gateway so concurrent
+    # voice calls (/v1/tts, /v1/stt, /v1/avatar/generate, /v1/ditto/warm) are scheduled
+    # by voice_gateway's finer-grained model locks instead of blocking each other here.
     async with generation_lock:
         current_job_family = "voice"
         try:
@@ -1619,25 +1654,33 @@ async def _proxy_voice(path: str, request: Request) -> dict[str, Any]:
             key = _read_voice_gateway_key()
             if not key:
                 raise HTTPException(status_code=503, detail="missing internal voice gateway key")
-            timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=120.0, pool=10.0)
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                try:
-                    response = await client.post(
-                        f"{VOICE_GATEWAY_URL}{path}",
-                        json=payload,
-                        headers={"X-API-Key": key},
-                    )
-                except httpx.HTTPError as exc:
-                    raise HTTPException(status_code=502, detail=f"voice gateway unreachable: {exc}") from exc
-            if response.status_code >= 400:
-                try:
-                    detail = response.json()
-                except ValueError:
-                    detail = response.text[:1000]
-                raise HTTPException(status_code=response.status_code, detail=detail)
-            return response.json()
+            _voice_inflight += 1
         finally:
             current_job_family = None
+
+    try:
+        client = _get_voice_gateway_client()
+        timeout = httpx.Timeout(connect=10.0, read=read_timeout, write=120.0, pool=10.0)
+        try:
+            response = await client.post(
+                f"{VOICE_GATEWAY_URL}{path}",
+                json=payload,
+                headers={"X-API-Key": key},
+                timeout=timeout,
+            )
+        except httpx.HTTPError as exc:
+            _voice_last_healthy_at = 0.0
+            raise HTTPException(status_code=502, detail=f"voice gateway unreachable: {exc}") from exc
+        if response.status_code >= 400:
+            try:
+                detail = response.json()
+            except ValueError:
+                detail = response.text[:1000]
+            raise HTTPException(status_code=response.status_code, detail=detail)
+        _voice_last_healthy_at = time.monotonic()
+        return response.json()
+    finally:
+        _voice_inflight = max(0, _voice_inflight - 1)
 
 
 @app.post("/internal/voice/warm")

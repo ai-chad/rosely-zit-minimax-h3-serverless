@@ -150,7 +150,13 @@ if [[ ! -d "$VOICE_APP_DIR/.git" ]]; then
   rm -rf "$VOICE_APP_DIR"
   git clone --depth 1 --single-branch --branch "$VOICE_REF" "$VOICE_REPO" "$VOICE_APP_DIR"
 else
-  log "Voice Avatar runtime repo already present at ${VOICE_APP_DIR}"
+  log "Updating Voice Avatar runtime repo ${VOICE_REPO}@${VOICE_REF} at ${VOICE_APP_DIR}"
+  git -C "$VOICE_APP_DIR" remote set-url origin "$VOICE_REPO"
+  if git -C "$VOICE_APP_DIR" fetch --depth 1 origin "$VOICE_REF"; then
+    git -C "$VOICE_APP_DIR" checkout --force -B "$VOICE_REF" FETCH_HEAD
+  else
+    log "WARN: Failed to fetch ${VOICE_REPO}@${VOICE_REF}; keeping existing checkout at ${VOICE_APP_DIR}"
+  fi
 fi
 [[ -f "$VOICE_APP_DIR/voice_gateway.py" && -f "$VOICE_APP_DIR/ditto_server.py" && -f "$VOICE_APP_DIR/requirements-ditto.txt" ]] \
   || { log "ERROR: Incomplete Voice Avatar repo at ${VOICE_APP_DIR}"; exit 1; }
