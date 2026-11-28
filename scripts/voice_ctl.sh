@@ -134,6 +134,22 @@ start_all() {
   stop_all
   cd "$VOICE_APP_DIR"
 
+  # Ensure Ditto's pyximport Cython blend extension is compiled once before
+  # launching ditto_server and live_agent in parallel (prevents first-start race).
+  local ditto_py="${WORKSPACE}/rosely-venvs/ditto/bin/python"
+  if [[ -x "$ditto_py" && -d "$DITTO_ROOT/core/utils/blend" ]] \
+     && ! compgen -G "${HOME:-/root}/.pyxbld/*/core/utils/blend/blend*.so" >/dev/null 2>&1; then
+    log "Pre-compiling Ditto Cython blend extension before parallel start"
+    DITTO_ROOT="$DITTO_ROOT" LD_LIBRARY_PATH="${DITTO_CUDNN8_DIR}:${LD_LIBRARY_PATH:-}" \
+      "$ditto_py" - <<'PY' || log "WARN: Ditto blend pre-compile failed; continuing"
+import os, sys
+root = os.environ["DITTO_ROOT"]
+sys.path.insert(0, root)
+os.chdir(root)
+from core.utils.blend import blend_images_cy  # noqa: F401
+PY
+  fi
+
   # Launch ASR, TTS, Ditto, and optional Live agent in parallel to minimize
   # switch-in latency (~10-20s instead of ~45-60s serial).
   launch_api asr asr asr_server 127.0.0.1 "$ASR_PORT"

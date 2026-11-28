@@ -256,6 +256,21 @@ PY
   touch "$ENVS/ditto/.rosely_installed"
 fi
 
+# Pre-compile Ditto's pyximport Cython extension once in a single process so
+# ditto_server and live_agent never race building /root/.pyxbld/.../blend*.so on first start.
+if [[ -d "$DITTO_ROOT/core/utils/blend" ]]; then
+  log "Pre-compiling Ditto Cython blend extension"
+  DITTO_ROOT="$DITTO_ROOT" LD_LIBRARY_PATH="$CUDNN8_DIR/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}" \
+    "$ENVS/ditto/bin/python" - <<'PY' || log "WARN: Ditto blend pre-compile skipped; ditto_server will compile on first start"
+import os, sys
+root = os.environ["DITTO_ROOT"]
+sys.path.insert(0, root)
+os.chdir(root)
+from core.utils.blend import blend_images_cy  # noqa: F401
+print("Ditto Cython blend extension ready")
+PY
+fi
+
 # 4. Write persistent secure voice environment config (preserving existing keys)
 write_status "installing" 96 "" "writing_env"
 log "Step 4/5: Writing ${WORKSPACE}/rosely-voice-avatar.env"
